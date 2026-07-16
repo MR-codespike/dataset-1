@@ -23,7 +23,10 @@ HF_TOKEN = os.environ.get("HF_TOKEN")
 HF_REPO_ID = os.environ.get("HF_REPO_ID", "MR-CODESPIKE/template-library")
 HF_REPO_TYPE = "dataset"
 
-OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/github/workspace/templates")
+# ✅ FIX: Use GITHUB_WORKSPACE if available, otherwise current working directory
+BASE_DIR = os.environ.get("GITHUB_WORKSPACE", os.getcwd())
+OUTPUT_DIR = os.path.join(BASE_DIR, "templates")
+
 PROGRESS_FILE = f"{OUTPUT_DIR}/_progress.json"
 FAILURES_FILE = f"{OUTPUT_DIR}/_failures.json"
 
