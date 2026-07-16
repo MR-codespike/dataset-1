@@ -1,0 +1,36 @@
+name: Review and Validate Templates
+
+on:
+  workflow_dispatch:   # manual trigger
+  schedule:
+    - cron: '0 12 * * 1'   # weekly on Monday at noon (adjust as needed)
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install -q huggingface_hub
+
+      - name: Run review script
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID: ${{ secrets.HF_REPO_ID }}
+        run: python review_templates.py
+
+      - name: Upload failures log (if any)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: validation-failures
+          path: review_temp/_validation_failures.json
+          retention-days: 7
