@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 OMNISIGN-500M – GitHub Actions Dataset Uploader
-Downloads from Kaggle → Chunks → Uploads to Hugging Face
+Downloads from Kaggle → Splits into 10 GB chunks → Uploads → Deletes
 """
 
 import os
@@ -10,8 +10,9 @@ import shutil
 import time
 import json
 import sys
+import glob
 from pathlib import Path
-from huggingface_hub import HfApi, login, upload_folder
+from huggingface_hub import HfApi, login, upload_file
 import psutil
 
 # =============================================================================
@@ -21,7 +22,7 @@ import psutil
 HF_TOKEN = os.environ.get("HF_TOKEN")
 REPO_ID = "MR-CODESPIKE/omnipose-raw-videos"
 WORK_DIR = "/tmp/omnipose_data"
-CHUNK_SIZE_GB = 15  # Upload in 15 GB chunks
+CHUNK_SIZE_GB = 10  # Upload in 10 GB chunks
 KAGGLE_DOWNLOADS = os.path.join(WORK_DIR, "kaggle_downloads")
 
 # Dataset configs
@@ -29,12 +30,14 @@ DATASETS = {
     "phoenix": {
         "slug": "duyt2231/phoenix2014t",
         "remote_path": "Phoenix-2014T/raw",
-        "size_gb": 39
+        "size_gb": 39,
+        "local_path": os.path.join(KAGGLE_DOWNLOADS, "phoenix")
     },
     "how2sign": {
         "slug": "nazarboholii/how2sign",
         "remote_path": "How2Sign/keypoints",
-        "size_gb": 75
+        "size_gb": 75,
+        "local_path": os.path.join(KAGGLE_DOWNLOADS, "how2sign")
     }
 }
 
@@ -81,7 +84,7 @@ def download_kaggle_dataset(dataset_slug, output_dir):
     
     # Check free space
     free = get_free_space_gb()
-    print(f"   💾 Free space: {free} GB")
+    print(f"   💾 Free space before download: {free} GB")
     
     cmd = ['kaggle', 'datasets', 'download', '-d', dataset_slug, '-p', output_dir, '--unzip']
     
@@ -102,12 +105,46 @@ def get_uploaded_files(remote_path):
     except:
         return []
 
-def chunk_and_upload(local_folder, remote_path, dataset_name):
+def upload_chunk(file_list, remote_path, chunk_num, total_chunks):
+    """Upload a chunk of files to Hugging Face."""
+    api = HfApi()
+    success_count = 0
+    chunk_size_gb = 0
+    
+    print(f"\n   📦 Chunk {chunk_num}/{total_chunks}: {len(file_list)} files")
+    
+    for file_path in file_list:
+        # Calculate relative path
+        rel_path = os.path.basename(file_path)
+        # Determine subfolder structure if needed
+        remote_file = f"{remote_path}/{rel_path}"
+        
+        file_size_gb = os.path.getsize(file_path) / (1024**3)
+        chunk_size_gb += file_size_gb
+        
+        try:
+            print(f"      ⬆️ Uploading: {rel_path} ({file_size_gb:.2f} GB)")
+            api.upload_file(
+                path_or_fileobj=file_path,
+                path_in_repo=remote_file,
+                repo_id=REPO_ID,
+                repo_type="dataset",
+            )
+            success_count += 1
+            # Delete immediately after upload to free space
+            os.remove(file_path)
+            print(f"      ✅ Uploaded & deleted: {rel_path}")
+        except Exception as e:
+            print(f"      ❌ Failed: {rel_path} - {e}")
+    
+    print(f"   ✅ Chunk {chunk_num} complete! ({success_count}/{len(file_list)} uploaded, {chunk_size_gb:.2f} GB)")
+    return success_count == len(file_list)
+
+def upload_in_chunks(local_folder, remote_path, dataset_name):
     """
-    Split folder into chunks and upload each chunk.
-    CHUNK_SIZE_GB controls how much to upload per chunk.
+    Upload files in 10 GB chunks, deleting each file after upload.
     """
-    print(f"\n📤 UPLOADING CHUNKS: {dataset_name}")
+    print(f"\n📤 UPLOADING IN CHUNKS: {dataset_name}")
     print(f"   📁 Source: {local_folder}")
     print(f"   📁 Target: {REPO_ID}/{remote_path}")
     print(f"   📦 Chunk size: {CHUNK_SIZE_GB} GB")
@@ -116,83 +153,74 @@ def chunk_and_upload(local_folder, remote_path, dataset_name):
         print("   ❌ Local folder not found!")
         return False
     
-    # Get list of files
+    # Get all files
     all_files = []
     for root, dirs, files in os.walk(local_folder):
         for f in files:
             file_path = os.path.join(root, f)
-            rel_path = os.path.relpath(file_path, local_folder)
             size = os.path.getsize(file_path)
-            all_files.append((rel_path, size, file_path))
+            all_files.append((file_path, size))
     
     if not all_files:
         print("   ⚠️ No files found!")
         return False
     
-    # Sort by size (largest first)
-    all_files.sort(key=lambda x: x[1], reverse=True)
-    
     # Check what's already uploaded
     uploaded_files = set(get_uploaded_files(remote_path))
-    remaining = [(r, s, p) for r, s, p in all_files if f"{remote_path}/{r}" not in uploaded_files]
+    uploaded_paths = set()
+    for uploaded in uploaded_files:
+        # Extract filename from remote path
+        filename = uploaded.split('/')[-1]
+        uploaded_paths.add(filename)
+    
+    # Filter out already uploaded files
+    remaining = [(p, s) for p, s in all_files if os.path.basename(p) not in uploaded_paths]
     
     if not remaining:
         print("   ✅ All files already uploaded!")
         return True
     
-    total_gb = sum(s for _, s, _ in remaining) / (1024**3)
+    total_gb = sum(s for _, s in remaining) / (1024**3)
     print(f"   📊 Remaining: {len(remaining)} files ({total_gb:.1f} GB)")
+    
+    # Sort by size (largest first)
+    remaining.sort(key=lambda x: x[1], reverse=True)
     
     # Upload in chunks
     chunk_num = 1
+    total_chunks = max(1, int(total_gb / CHUNK_SIZE_GB) + 1)
+    
     while remaining:
-        # Calculate chunk size
-        chunk_size_bytes = CHUNK_SIZE_GB * (1024**3)
+        # Select files for this chunk (up to CHUNK_SIZE_GB)
         chunk_files = []
         chunk_size = 0
+        chunk_size_limit = CHUNK_SIZE_GB * (1024**3)
         
-        # Select files for this chunk
-        while remaining and chunk_size < chunk_size_bytes:
-            rel_path, size, file_path = remaining.pop(0)
-            chunk_files.append((rel_path, file_path))
+        while remaining and chunk_size < chunk_size_limit:
+            file_path, size = remaining.pop(0)
+            chunk_files.append(file_path)
             chunk_size += size
         
         chunk_gb = chunk_size / (1024**3)
-        print(f"\n   📦 Chunk {chunk_num}: {len(chunk_files)} files ({chunk_gb:.2f} GB)")
+        print(f"\n   📦 Chunk {chunk_num}/{total_chunks}: {len(chunk_files)} files ({chunk_gb:.2f} GB)")
         
-        # Upload this chunk (upload each file individually)
-        api = HfApi()
-        success_count = 0
-        for rel_path, file_path in chunk_files:
-            remote_file = f"{remote_path}/{rel_path}"
-            try:
-                print(f"      ⬆️ Uploading: {rel_path}")
-                api.upload_file(
-                    path_or_fileobj=file_path,
-                    path_in_repo=remote_file,
-                    repo_id=REPO_ID,
-                    repo_type="dataset",
-                )
-                success_count += 1
-            except Exception as e:
-                print(f"      ❌ Failed: {rel_path} - {e}")
+        # Upload this chunk
+        success = upload_chunk(chunk_files, remote_path, chunk_num, total_chunks)
         
-        print(f"   ✅ Chunk {chunk_num} complete! ({success_count}/{len(chunk_files)} uploaded)")
-        
-        # After each chunk, check if we need to clean up
+        # Check free space after chunk
         free = get_free_space_gb()
-        print(f"   💾 Free space: {free} GB")
+        print(f"   💾 Free space after chunk: {free} GB")
         
         chunk_num += 1
         
-        # Exit early if we're running low on space
-        if free < 5:
-            print("   ⚠️ Low disk space! Pausing to let previous chunk finish uploading...")
+        # If we're running low on space, wait
+        if free < 2:
+            print("   ⚠️ Low disk space! Waiting 60 seconds...")
             time.sleep(60)
     
     # Final verification
     uploaded = get_uploaded_files(remote_path)
-    print(f"\n   📊 Total uploaded: {len(uploaded)} files")
+    print(f"\n   📊 Total uploaded files: {len(uploaded)}")
     return True
 
 def cleanup_after_upload(local_folder, dataset_name):
@@ -224,64 +252,44 @@ def main():
     free = get_free_space_gb()
     print(f"💾 Initial free space: {free} GB\n")
     
-    # Process Phoenix
-    print("\n" + "="*70)
-    print("📌 PHASE 1: Phoenix-2014T")
-    print("="*70)
-    
-    phoenix_path = os.path.join(KAGGLE_DOWNLOADS, "phoenix")
-    phoenix_remote = "Phoenix-2014T/raw"
-    
-    # Download if not exists
-    if not os.path.exists(phoenix_path) or get_folder_size_gb(phoenix_path) < 1:
-        print("   📥 Downloading Phoenix...")
-        if download_kaggle_dataset("duyt2231/phoenix2014t", phoenix_path):
-            print("   ✅ Phoenix downloaded!")
+    # Process each dataset
+    for dataset_name, config in DATASETS.items():
+        print("\n" + "="*70)
+        print(f"📌 PROCESSING: {dataset_name.upper()}")
+        print("="*70)
+        
+        local_path = config["local_path"]
+        remote_path = config["remote_path"]
+        slug = config["slug"]
+        size_gb = config["size_gb"]
+        
+        # Check if we already have the files
+        if os.path.exists(local_path):
+            local_size = get_folder_size_gb(local_path)
+            print(f"   💾 Local folder exists: {local_size:.1f} GB")
         else:
-            print("   ❌ Phoenix download failed!")
-            sys.exit(1)
-    else:
-        print(f"   💾 Phoenix already downloaded: {get_folder_size_gb(phoenix_path):.1f} GB")
-    
-    # Upload Phoenix
-    chunk_and_upload(phoenix_path, phoenix_remote, "Phoenix")
-    
-    # Delete Phoenix after upload
-    cleanup_after_upload(phoenix_path, "Phoenix")
-    
-    # Process How2Sign
-    print("\n" + "="*70)
-    print("📌 PHASE 2: How2Sign")
-    print("="*70)
-    
-    how2sign_path = os.path.join(KAGGLE_DOWNLOADS, "how2sign")
-    how2sign_remote = "How2Sign/keypoints"
-    
-    # Check free space
-    free = get_free_space_gb()
-    print(f"💾 Free space before How2Sign: {free} GB")
-    
-    if free < 80:
-        print(f"⚠️ Not enough free space! Need 80 GB, have {free} GB")
-        print("   Please free up space and re-run.")
-        sys.exit(1)
-    
-    # Download if not exists
-    if not os.path.exists(how2sign_path) or get_folder_size_gb(how2sign_path) < 1:
-        print("   📥 Downloading How2Sign...")
-        if download_kaggle_dataset("nazarboholii/how2sign", how2sign_path):
-            print("   ✅ How2Sign downloaded!")
+            local_size = 0
+        
+        # Download if needed
+        if local_size < 1:
+            print(f"   📥 Downloading {dataset_name} from Kaggle ({size_gb} GB)...")
+            if download_kaggle_dataset(slug, local_path):
+                print(f"   ✅ {dataset_name} downloaded!")
+            else:
+                print(f"   ❌ {dataset_name} download failed!")
+                continue
         else:
-            print("   ❌ How2Sign download failed!")
-            sys.exit(1)
-    else:
-        print(f"   💾 How2Sign already downloaded: {get_folder_size_gb(how2sign_path):.1f} GB")
-    
-    # Upload How2Sign
-    chunk_and_upload(how2sign_path, how2sign_remote, "How2Sign")
-    
-    # Delete How2Sign after upload
-    cleanup_after_upload(how2sign_path, "How2Sign")
+            print(f"   ✅ {dataset_name} already downloaded")
+        
+        # Upload in chunks
+        success = upload_in_chunks(local_path, remote_path, dataset_name)
+        
+        if success:
+            print(f"   ✅ {dataset_name} upload complete!")
+            # Delete to free space for next dataset
+            cleanup_after_upload(local_path, dataset_name)
+        else:
+            print(f"   ⚠️ {dataset_name} upload may be incomplete")
     
     # Final summary
     print("\n" + "="*70)
