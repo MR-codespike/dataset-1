@@ -6,24 +6,43 @@ on:
 jobs:
   upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 1440
+    timeout-minutes: 1440  # 24 hours max
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+
       - name: Install dependencies
         run: |
+          pip install --upgrade pip
           pip install huggingface-hub kaggle psutil kagglehub
-      - name: Setup Kaggle
+
+      - name: Setup Kaggle credentials
         run: |
           mkdir -p ~/.kaggle
           echo '{"username":"${{ secrets.KAGGLE_USERNAME }}","key":"${{ secrets.KAGGLE_KEY }}"}' > ~/.kaggle/kaggle.json
           chmod 600 ~/.kaggle/kaggle.json
-      - name: Check disk space
+
+      - name: Check disk space before
         run: df -h
+
       - name: Run upload script
         run: python upload_datasets.py
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      - name: Check disk space after
+        run: df -h
+
+      - name: Upload status summary
+        if: always()
+        run: |
+          echo "## 📊 Upload Status" >> $GITHUB_STEP_SUMMARY
+          echo "Workflow completed at: $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "Repository: https://huggingface.co/datasets/MR-CODESPIKE/omnipose-raw-videos" >> $GITHUB_STEP_SUMMARY
+          df -h >> $GITHUB_STEP_SUMMARY
