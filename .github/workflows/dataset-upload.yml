@@ -1,0 +1,54 @@
+name: Dataset Upload Pipeline
+
+on:
+  workflow_dispatch:  # Manual trigger only
+  # schedule:
+  #   - cron: '0 */6 * * *'  # Optional: run every 6 hours
+
+env:
+  HF_REPO: MR-CODESPIKE/omnipose-raw-videos
+  WORK_DIR: /tmp/omnipose_data
+  CHUNK_SIZE: 15  # GB per chunk
+
+jobs:
+  upload-datasets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1440  # 24 hours max
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        pip install --upgrade pip
+        pip install huggingface-hub kaggle psutil tqdm
+    
+    - name: Setup Kaggle credentials
+      run: |
+        mkdir -p ~/.kaggle
+        echo '{"username":"${{ secrets.KAGGLE_USERNAME }}","key":"${{ secrets.KAGGLE_KEY }}"}' > ~/.kaggle/kaggle.json
+        chmod 600 ~/.kaggle/kaggle.json
+      env:
+        KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+        KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+    
+    - name: Login to Hugging Face
+      run: |
+        python -c "
+        from huggingface_hub import login
+        login(token='${{ secrets.HF_TOKEN }}')
+        print('✅ Logged in to Hugging Face')
+        "
+    
+    - name: Run dataset upload script
+      run: python upload_datasets.py
+      env:
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+        KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
