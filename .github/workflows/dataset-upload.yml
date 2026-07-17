@@ -15,7 +15,7 @@ jobs:
           python-version: '3.10'
       - name: Install dependencies
         run: |
-          pip install huggingface-hub kaggle psutil
+          pip install huggingface-hub kaggle psutil kagglehub
       - name: Setup Kaggle
         run: |
           mkdir -p ~/.kaggle
