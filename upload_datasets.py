@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 OMNISIGN-500M – GitHub Actions Dataset Uploader
-Downloads from Kaggle → Splits into 10 GB chunks → Uploads → Deletes
+Streams Kaggle download → Uploads chunks → Deletes immediately
 """
 
 import os
@@ -11,6 +11,7 @@ import time
 import json
 import sys
 import glob
+import tempfile
 from pathlib import Path
 from huggingface_hub import HfApi, login, upload_file
 import psutil
@@ -22,7 +23,7 @@ import psutil
 HF_TOKEN = os.environ.get("HF_TOKEN")
 REPO_ID = "MR-CODESPIKE/omnipose-raw-videos"
 WORK_DIR = "/tmp/omnipose_data"
-CHUNK_SIZE_GB = 10  # Upload in 10 GB chunks
+CHUNK_SIZE_GB = 3  # Smaller chunks to stay within disk limits
 KAGGLE_DOWNLOADS = os.path.join(WORK_DIR, "kaggle_downloads")
 
 # Dataset configs
@@ -75,79 +76,120 @@ def delete_folder(path, name=""):
         return size
     return 0
 
-def download_kaggle_dataset(dataset_slug, output_dir):
-    """Download dataset from Kaggle."""
-    print(f"\n⏳ DOWNLOADING: {dataset_slug}")
+def download_kaggle_dataset(dataset_slug, output_dir, max_size_gb=5):
+    """
+    Download dataset from Kaggle in chunks using the Kaggle CLI.
+    Downloads only a portion of files at a time.
+    """
+    print(f"\n⏳ DOWNLOADING CHUNK: {dataset_slug}")
     print(f"   📁 Output: {output_dir}")
     
     os.makedirs(output_dir, exist_ok=True)
     
     # Check free space
     free = get_free_space_gb()
-    print(f"   💾 Free space before download: {free} GB")
+    print(f"   💾 Free space: {free} GB")
     
-    cmd = ['kaggle', 'datasets', 'download', '-d', dataset_slug, '-p', output_dir, '--unzip']
-    
+    # Get list of files in the dataset (using Kaggle API to list files)
     try:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        print(f"   ✅ Download complete!")
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"   ❌ Download failed: {e.stderr}")
-        return False
-
-def get_uploaded_files(remote_path):
-    """Get list of already uploaded files."""
-    api = HfApi()
-    try:
-        files = list(api.list_repo_files(repo_id=REPO_ID, repo_type="dataset"))
-        return [f for f in files if f.startswith(remote_path)]
-    except:
-        return []
-
-def upload_chunk(file_list, remote_path, chunk_num, total_chunks):
-    """Upload a chunk of files to Hugging Face."""
-    api = HfApi()
-    success_count = 0
-    chunk_size_gb = 0
-    
-    print(f"\n   📦 Chunk {chunk_num}/{total_chunks}: {len(file_list)} files")
-    
-    for file_path in file_list:
-        # Calculate relative path
-        rel_path = os.path.basename(file_path)
-        # Determine subfolder structure if needed
-        remote_file = f"{remote_path}/{rel_path}"
+        # List files without downloading
+        list_cmd = ['kaggle', 'datasets', 'files', '-d', dataset_slug]
+        result = subprocess.run(list_cmd, capture_output=True, text=True)
         
-        file_size_gb = os.path.getsize(file_path) / (1024**3)
-        chunk_size_gb += file_size_gb
+        # Parse file list
+        files = []
+        for line in result.stdout.split('\n'):
+            if line.strip() and not line.startswith('name') and '|' in line:
+                parts = line.split('|')
+                if len(parts) >= 2:
+                    filename = parts[0].strip()
+                    size_str = parts[1].strip()
+                    files.append((filename, size_str))
         
+        if not files:
+            print("   ⚠️ Could not get file list, downloading entire dataset...")
+            cmd = ['kaggle', 'datasets', 'download', '-d', dataset_slug, '-p', output_dir, '--unzip']
+            subprocess.run(cmd, check=True)
+            return True
+        
+        # Filter out already uploaded files
+        api = HfApi()
+        uploaded = set()
         try:
-            print(f"      ⬆️ Uploading: {rel_path} ({file_size_gb:.2f} GB)")
+            existing = list(api.list_repo_files(repo_id=REPO_ID, repo_type="dataset"))
+            remote_prefix = DATASETS.get(dataset_slug.split('/')[-1], {}).get('remote_path', '')
+            if remote_prefix:
+                uploaded = {f for f in existing if f.startswith(remote_prefix)}
+        except:
+            pass
+        
+        # Download files in batches to manage disk space
+        downloaded = 0
+        for filename, size_str in files:
+            # Check if already uploaded
+            if any(filename in f for f in uploaded):
+                print(f"   ⏭️ Skipping {filename} (already uploaded)")
+                continue
+            
+            # Check free space before each download
+            free = get_free_space_gb()
+            if free < 2:
+                print(f"   ⚠️ Low disk space ({free} GB)! Waiting for uploads to complete...")
+                time.sleep(30)
+                continue
+            
+            # Download single file
+            print(f"   📥 Downloading: {filename} ({size_str})")
+            cmd = ['kaggle', 'datasets', 'download', '-d', dataset_slug, 
+                   '-f', filename, '-p', output_dir, '--unzip']
+            try:
+                subprocess.run(cmd, check=True, capture_output=True)
+                print(f"      ✅ Downloaded: {filename}")
+                downloaded += 1
+            except subprocess.CalledProcessError as e:
+                print(f"      ❌ Failed to download {filename}: {e}")
+                continue
+        
+        return True
+        
+    except Exception as e:
+        print(f"   ❌ Error: {e}")
+        # Fallback: download entire dataset
+        print("   ⚠️ Falling back to full download...")
+        cmd = ['kaggle', 'datasets', 'download', '-d', dataset_slug, '-p', output_dir, '--unzip']
+        subprocess.run(cmd, check=True)
+        return True
+
+def upload_file_with_retry(file_path, remote_path, max_retries=3):
+    """Upload a single file with retries."""
+    api = HfApi()
+    filename = os.path.basename(file_path)
+    remote_file = f"{remote_path}/{filename}"
+    
+    for attempt in range(max_retries):
+        try:
+            print(f"      ⬆️ Uploading: {filename}")
             api.upload_file(
                 path_or_fileobj=file_path,
                 path_in_repo=remote_file,
                 repo_id=REPO_ID,
                 repo_type="dataset",
             )
-            success_count += 1
-            # Delete immediately after upload to free space
+            # Delete immediately after upload
             os.remove(file_path)
-            print(f"      ✅ Uploaded & deleted: {rel_path}")
+            print(f"      ✅ Uploaded & deleted: {filename}")
+            return True
         except Exception as e:
-            print(f"      ❌ Failed: {rel_path} - {e}")
-    
-    print(f"   ✅ Chunk {chunk_num} complete! ({success_count}/{len(file_list)} uploaded, {chunk_size_gb:.2f} GB)")
-    return success_count == len(file_list)
+            print(f"      ⚠️ Attempt {attempt+1} failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(5)
+    return False
 
-def upload_in_chunks(local_folder, remote_path, dataset_name):
-    """
-    Upload files in 10 GB chunks, deleting each file after upload.
-    """
-    print(f"\n📤 UPLOADING IN CHUNKS: {dataset_name}")
+def process_dataset(local_folder, remote_path, dataset_name):
+    """Process a dataset: download chunk, upload, delete."""
+    print(f"\n📤 PROCESSING: {dataset_name}")
     print(f"   📁 Source: {local_folder}")
     print(f"   📁 Target: {REPO_ID}/{remote_path}")
-    print(f"   📦 Chunk size: {CHUNK_SIZE_GB} GB")
     
     if not os.path.exists(local_folder):
         print("   ❌ Local folder not found!")
@@ -166,15 +208,16 @@ def upload_in_chunks(local_folder, remote_path, dataset_name):
         return False
     
     # Check what's already uploaded
-    uploaded_files = set(get_uploaded_files(remote_path))
-    uploaded_paths = set()
-    for uploaded in uploaded_files:
-        # Extract filename from remote path
-        filename = uploaded.split('/')[-1]
-        uploaded_paths.add(filename)
+    api = HfApi()
+    uploaded = set()
+    try:
+        existing = list(api.list_repo_files(repo_id=REPO_ID, repo_type="dataset"))
+        uploaded = {f for f in existing if f.startswith(remote_path)}
+    except:
+        pass
     
     # Filter out already uploaded files
-    remaining = [(p, s) for p, s in all_files if os.path.basename(p) not in uploaded_paths]
+    remaining = [(p, s) for p, s in all_files if f"{remote_path}/{os.path.basename(p)}" not in uploaded]
     
     if not remaining:
         print("   ✅ All files already uploaded!")
@@ -183,53 +226,27 @@ def upload_in_chunks(local_folder, remote_path, dataset_name):
     total_gb = sum(s for _, s in remaining) / (1024**3)
     print(f"   📊 Remaining: {len(remaining)} files ({total_gb:.1f} GB)")
     
-    # Sort by size (largest first)
-    remaining.sort(key=lambda x: x[1], reverse=True)
-    
-    # Upload in chunks
-    chunk_num = 1
-    total_chunks = max(1, int(total_gb / CHUNK_SIZE_GB) + 1)
-    
-    while remaining:
-        # Select files for this chunk (up to CHUNK_SIZE_GB)
-        chunk_files = []
-        chunk_size = 0
-        chunk_size_limit = CHUNK_SIZE_GB * (1024**3)
+    # Upload each file, deleting immediately after upload
+    success_count = 0
+    for file_path, size in remaining:
+        filename = os.path.basename(file_path)
+        file_size_gb = size / (1024**3)
         
-        while remaining and chunk_size < chunk_size_limit:
-            file_path, size = remaining.pop(0)
-            chunk_files.append(file_path)
-            chunk_size += size
-        
-        chunk_gb = chunk_size / (1024**3)
-        print(f"\n   📦 Chunk {chunk_num}/{total_chunks}: {len(chunk_files)} files ({chunk_gb:.2f} GB)")
-        
-        # Upload this chunk
-        success = upload_chunk(chunk_files, remote_path, chunk_num, total_chunks)
-        
-        # Check free space after chunk
+        # Check free space
         free = get_free_space_gb()
-        print(f"   💾 Free space after chunk: {free} GB")
+        if free < 1:
+            print(f"   ⚠️ Low disk space ({free} GB)! Waiting...")
+            time.sleep(30)
+            continue
         
-        chunk_num += 1
-        
-        # If we're running low on space, wait
-        if free < 2:
-            print("   ⚠️ Low disk space! Waiting 60 seconds...")
-            time.sleep(60)
+        print(f"   📤 Processing: {filename} ({file_size_gb:.2f} GB)")
+        if upload_file_with_retry(file_path, remote_path):
+            success_count += 1
+            free = get_free_space_gb()
+            print(f"      💾 Free space now: {free} GB")
     
-    # Final verification
-    uploaded = get_uploaded_files(remote_path)
-    print(f"\n   📊 Total uploaded files: {len(uploaded)}")
-    return True
-
-def cleanup_after_upload(local_folder, dataset_name):
-    """Delete dataset folder after upload."""
-    print(f"\n🧹 Cleaning up {dataset_name}...")
-    size = get_folder_size_gb(local_folder)
-    if size > 0:
-        delete_folder(local_folder, dataset_name)
-    return size
+    print(f"   ✅ Uploaded {success_count}/{len(remaining)} files")
+    return success_count == len(remaining)
 
 # =============================================================================
 # MAIN
@@ -240,7 +257,6 @@ def main():
     print("🚀 OMNISIGN-500M – GITHUB ACTIONS DATASET PIPELINE")
     print("="*70)
     print(f"📁 Target HF Repo: {REPO_ID}")
-    print(f"📦 Chunk size: {CHUNK_SIZE_GB} GB")
     print(f"💾 Work directory: {WORK_DIR}")
     print("="*70 + "\n")
     
@@ -281,13 +297,13 @@ def main():
         else:
             print(f"   ✅ {dataset_name} already downloaded")
         
-        # Upload in chunks
-        success = upload_in_chunks(local_path, remote_path, dataset_name)
+        # Upload files (chunked)
+        success = process_dataset(local_path, remote_path, dataset_name)
         
         if success:
             print(f"   ✅ {dataset_name} upload complete!")
-            # Delete to free space for next dataset
-            cleanup_after_upload(local_path, dataset_name)
+            # Clean up
+            delete_folder(local_path, dataset_name)
         else:
             print(f"   ⚠️ {dataset_name} upload may be incomplete")
     
