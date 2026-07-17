@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 OMNISIGN-500M – GitHub Actions Dataset Uploader
-Uses Kaggle CLI to download, uploads file-by-file, deletes after upload.
+Downloads zip file (not unzipped), extracts file-by-file, uploads, deletes.
 """
 
 import os
@@ -10,6 +10,7 @@ import time
 import shutil
 import subprocess
 import psutil
+import zipfile
 from huggingface_hub import HfApi, upload_file
 
 # =============================================================================
@@ -71,63 +72,114 @@ def upload_and_delete(file_path, remote_path, filename):
         log(f"      ❌ Upload failed: {e}")
         return False
 
-def download_dataset(slug, output_dir):
-    log(f"   📥 Downloading {slug} via Kaggle CLI...")
-    cmd = ['kaggle', 'datasets', 'download', '-d', slug, '-p', output_dir, '--unzip']
+def download_dataset_without_unzip(slug, output_dir):
+    """Download dataset zip without unzipping."""
+    log(f"   📥 Downloading {slug} via Kaggle CLI (no unzip)...")
+    zip_path = os.path.join(output_dir, f"{slug.replace('/', '_')}.zip")
+    cmd = ['kaggle', 'datasets', 'download', '-d', slug, '-p', output_dir]
     try:
-        # Run with streaming output to see progress
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         for line in process.stdout:
             log(f"      {line.strip()}")
         process.wait()
         if process.returncode != 0:
             log(f"   ❌ Download failed with code {process.returncode}")
-            return False
-        log(f"   ✅ Download complete!")
-        return True
+            return None
+        # Find the downloaded zip
+        for f in os.listdir(output_dir):
+            if f.endswith('.zip'):
+                zip_path = os.path.join(output_dir, f)
+                log(f"   ✅ Downloaded: {zip_path}")
+                return zip_path
+        log("   ❌ No zip file found")
+        return None
     except Exception as e:
         log(f"   ❌ Download failed: {e}")
+        return None
+
+def extract_file_by_file(zip_path, output_dir, remote_path, dataset_name):
+    """Extract files one by one from zip, upload each, delete immediately."""
+    log(f"\n📤 EXTRACTING & UPLOADING: {dataset_name}")
+    
+    if not os.path.exists(zip_path):
+        log("   ❌ Zip file not found!")
         return False
 
-def process_dataset(local_folder, remote_path, dataset_name):
-    log(f"\n📤 PROCESSING FILES: {dataset_name}")
-    log(f"   📁 Source: {local_folder}")
-    log(f"   📁 Target: {REPO_ID}/{remote_path}")
+    # Check free space for extraction
+    free = get_free_space_gb()
+    log(f"   💾 Free space before extraction: {free} GB")
 
-    if not os.path.exists(local_folder):
-        log("   ❌ Local folder not found!")
-        return False
-
-    all_files = []
-    for root, dirs, files in os.walk(local_folder):
-        for f in files:
-            file_path = os.path.join(root, f)
-            all_files.append((f, file_path))
-
-    if not all_files:
-        log("   ⚠️ No files found!")
-        return False
-
-    uploaded = get_uploaded_filenames(remote_path)
-    log(f"   📊 Total files: {len(all_files)}")
-    log(f"   📊 Already uploaded: {len(uploaded)}")
+    uploaded_filenames = get_uploaded_filenames(remote_path)
+    log(f"   📊 Already uploaded: {len(uploaded_filenames)} files")
 
     success_count = 0
-    for filename, file_path in all_files:
-        if filename in uploaded:
-            log(f"   ⏭️ Skipping {filename} (already uploaded)")
-            continue
+    total_files = 0
 
-        free = get_free_space_gb()
-        if free < 1:
-            log(f"   ⚠️ Low disk space ({free} GB)! Waiting 30s...")
-            time.sleep(30)
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            file_list = zip_ref.namelist()
+            total_files = len(file_list)
+            log(f"   📊 Total files in zip: {total_files}")
 
-        if upload_and_delete(file_path, remote_path, filename):
-            success_count += 1
+            for idx, filename in enumerate(file_list):
+                # Skip directories
+                if filename.endswith('/'):
+                    continue
+
+                base_filename = os.path.basename(filename)
+                if base_filename in uploaded_filenames:
+                    log(f"   ⏭️ Skipping {base_filename} (already uploaded)")
+                    continue
+
+                # Extract single file to memory
+                log(f"   📤 [{idx+1}/{total_files}] Extracting: {base_filename}")
+
+                try:
+                    # Extract to temp file
+                    temp_path = os.path.join(output_dir, base_filename)
+                    with open(temp_path, 'wb') as f:
+                        f.write(zip_ref.read(filename))
+                    
+                    # Upload and delete
+                    if upload_and_delete(temp_path, remote_path, base_filename):
+                        success_count += 1
+                    
+                    # Check free space periodically
+                    free = get_free_space_gb()
+                    if free < 1:
+                        log(f"   ⚠️ Low disk space ({free} GB)! Waiting 30s...")
+                        time.sleep(30)
+
+                except Exception as e:
+                    log(f"      ❌ Failed to extract {filename}: {e}")
+                    # Try to clean up temp file
+                    temp_path = os.path.join(output_dir, base_filename)
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+
+    except zipfile.BadZipFile:
+        log(f"   ❌ Corrupt zip file!")
+        return False
 
     log(f"   ✅ Uploaded {success_count} new files")
     return True
+
+def process_dataset(slug, output_dir, remote_path, dataset_name):
+    """Full pipeline: download zip → extract file-by-file → upload → delete."""
+    zip_path = download_dataset_without_unzip(slug, output_dir)
+    if not zip_path:
+        log(f"   ❌ Failed to download {dataset_name}")
+        return False
+
+    # Extract and upload
+    success = extract_file_by_file(zip_path, output_dir, remote_path, dataset_name)
+
+    # Delete the zip file
+    if os.path.exists(zip_path):
+        os.remove(zip_path)
+        log(f"   🗑️ Deleted zip file")
+
+    return success
 
 # =============================================================================
 # MAIN
@@ -135,7 +187,7 @@ def process_dataset(local_folder, remote_path, dataset_name):
 
 def main():
     log("\n" + "="*70)
-    log("🚀 OMNISIGN-500M – GITHUB ACTIONS DATASET PIPELINE (CLI)")
+    log("🚀 OMNISIGN-500M – GITHUB ACTIONS PIPELINE (ZIP STREAMING)")
     log("="*70)
     log(f"📁 Target HF Repo: {REPO_ID}")
     log(f"💾 Work directory: {WORK_DIR}")
@@ -163,15 +215,13 @@ def main():
             log("   Free up space and re-run.")
             sys.exit(1)
 
-        if not download_dataset(slug, output_dir):
-            log(f"   ❌ Failed to download {dataset_name}")
-            continue
+        # Process the dataset (download zip, extract, upload, delete)
+        process_dataset(slug, output_dir, remote_path, dataset_name)
 
-        process_dataset(output_dir, remote_path, dataset_name)
-
-        log(f"\n🧹 Cleaning up {dataset_name}...")
-        shutil.rmtree(output_dir, ignore_errors=True)
-        log(f"   ✅ Deleted {output_dir}")
+        # Clean up the entire output directory
+        if os.path.exists(output_dir):
+            shutil.rmtree(output_dir, ignore_errors=True)
+            log(f"   🗑️ Deleted {output_dir}")
 
         free = get_free_space_gb()
         log(f"💾 Free space after {dataset_name}: {free} GB")
