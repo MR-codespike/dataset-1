@@ -1,0 +1,43 @@
+name: Generate Effects Library
+
+on:
+  workflow_dispatch:                           # manual trigger
+  schedule:
+    - cron: '0 3 * * 0'                       # weekly on Sunday at 3 AM UTC
+  push:
+    branches: [ main ]
+    paths:
+      - 'generate_effects.py'                # re-run when script changes
+
+jobs:
+  generate-effects:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install -q huggingface_hub requests
+
+      - name: Generate effects
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID: ${{ secrets.HF_REPO_ID }}
+          AUTO_UPLOAD: true   # optional, can be changed
+        run: python generate_effects.py
+
+      - name: Upload effects as artifact (backup)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: generated-effects
+          path: effects/
+          retention-days: 7
