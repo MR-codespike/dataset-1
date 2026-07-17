@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-OMNISIGN-500M – GitHub Actions Dataset Uploader (Simplified)
-Downloads entire dataset → Uploads file-by-file → Deletes each file after upload
+OMNISIGN-500M – GitHub Actions Dataset Uploader (Robust)
+Uses kagglehub for reliable download, uploads file-by-file with detailed logs.
 """
 
 import os
-import subprocess
-import shutil
-import time
 import sys
-from huggingface_hub import HfApi, upload_file
+import time
+import shutil
 import psutil
+from huggingface_hub import HfApi, upload_file
+import kagglehub
 
 # =============================================================================
 # CONFIGURATION
@@ -21,7 +21,6 @@ REPO_ID = "MR-CODESPIKE/omnipose-raw-videos"
 WORK_DIR = "/tmp/omnipose_data"
 KAGGLE_DOWNLOADS = os.path.join(WORK_DIR, "kaggle_downloads")
 
-# Dataset configs
 DATASETS = {
     "phoenix": {
         "slug": "duyt2231/phoenix2014t",
@@ -39,25 +38,27 @@ DATASETS = {
 # HELPERS
 # =============================================================================
 
+def log(msg):
+    print(msg, flush=True)
+
 def get_free_space_gb():
     return psutil.disk_usage('/').free // (1024**3)
 
 def get_uploaded_filenames(remote_path):
-    """Get set of filenames already uploaded to HF under this remote path."""
     api = HfApi()
     try:
         files = list(api.list_repo_files(repo_id=REPO_ID, repo_type="dataset"))
         return {f.split('/')[-1] for f in files if f.startswith(remote_path)}
-    except:
+    except Exception as e:
+        log(f"   ⚠️ Could not list uploaded files: {e}")
         return set()
 
 def upload_and_delete(file_path, remote_path, filename):
-    """Upload a single file to HF and delete it locally."""
     api = HfApi()
     remote_file = f"{remote_path}/{filename}"
     try:
         file_size = os.path.getsize(file_path) / (1024**2)
-        print(f"      ⬆️ Uploading: {filename} ({file_size:.1f} MB)")
+        log(f"      ⬆️ Uploading: {filename} ({file_size:.1f} MB)")
         api.upload_file(
             path_or_fileobj=file_path,
             path_in_repo=remote_file,
@@ -65,35 +66,45 @@ def upload_and_delete(file_path, remote_path, filename):
             repo_type="dataset",
         )
         os.remove(file_path)
-        print(f"      ✅ Uploaded & deleted: {filename}")
+        log(f"      ✅ Uploaded & deleted: {filename}")
         return True
     except Exception as e:
-        print(f"      ❌ Upload failed: {e}")
+        log(f"      ❌ Upload failed: {e}")
         return False
 
-def download_dataset(slug, output_dir):
-    """Download entire dataset from Kaggle using CLI."""
-    print(f"   📥 Downloading {slug} ... (this may take a while)")
-    cmd = ['kaggle', 'datasets', 'download', '-d', slug, '-p', output_dir, '--unzip']
+def download_dataset_with_kagglehub(slug, output_dir):
+    """Download dataset using kagglehub (handles large files well)."""
+    log(f"   📥 Downloading {slug} via kagglehub...")
     try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-        print(f"   ✅ Download complete!")
+        # This downloads the dataset and returns the path
+        path = kagglehub.dataset_download(slug)
+        log(f"   ✅ Downloaded to: {path}")
+        # Copy files to our output_dir (or use symlink)
+        # We'll copy to keep control, but symlink is faster.
+        # For simplicity, we'll move all files to output_dir
+        for item in os.listdir(path):
+            src = os.path.join(path, item)
+            dst = os.path.join(output_dir, item)
+            if os.path.isdir(src):
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dst)
+        log(f"   ✅ Files copied to {output_dir}")
         return True
-    except subprocess.CalledProcessError as e:
-        print(f"   ❌ Download failed: {e.stderr}")
+    except Exception as e:
+        log(f"   ❌ Download failed: {e}")
         return False
 
 def process_dataset(local_folder, remote_path, dataset_name):
-    """Walk the local folder, upload each file (if not already uploaded), then delete it."""
-    print(f"\n📤 PROCESSING FILES: {dataset_name}")
-    print(f"   📁 Source: {local_folder}")
-    print(f"   📁 Target: {REPO_ID}/{remote_path}")
+    log(f"\n📤 PROCESSING FILES: {dataset_name}")
+    log(f"   📁 Source: {local_folder}")
+    log(f"   📁 Target: {REPO_ID}/{remote_path}")
 
     if not os.path.exists(local_folder):
-        print("   ❌ Local folder not found!")
+        log("   ❌ Local folder not found!")
         return False
 
-    # Get all files
+    # Collect files
     all_files = []
     for root, dirs, files in os.walk(local_folder):
         for f in files:
@@ -102,33 +113,32 @@ def process_dataset(local_folder, remote_path, dataset_name):
             all_files.append((rel_path, file_path))
 
     if not all_files:
-        print("   ⚠️ No files found!")
+        log("   ⚠️ No files found!")
         return False
 
-    # Get already uploaded filenames
     uploaded = get_uploaded_filenames(remote_path)
-    print(f"   📊 Total files: {len(all_files)}")
-    print(f"   📊 Already uploaded: {len(uploaded)}")
+    log(f"   📊 Total files: {len(all_files)}")
+    log(f"   📊 Already uploaded: {len(uploaded)}")
 
     # Process each file
     success_count = 0
     for rel_path, file_path in all_files:
         filename = os.path.basename(file_path)
         if filename in uploaded:
-            print(f"   ⏭️ Skipping {filename} (already uploaded)")
+            log(f"   ⏭️ Skipping {filename} (already uploaded)")
             continue
 
-        # Check free space before upload (just in case)
+        # Check free space
         free = get_free_space_gb()
         if free < 1:
-            print(f"   ⚠️ Low disk space ({free} GB)! Waiting...")
+            log(f"   ⚠️ Low disk space ({free} GB)! Waiting 30s...")
             time.sleep(30)
 
         # Upload and delete
         if upload_and_delete(file_path, remote_path, filename):
             success_count += 1
 
-    print(f"   ✅ Uploaded {success_count} new files")
+    log(f"   ✅ Uploaded {success_count} new files")
     return True
 
 # =============================================================================
@@ -136,59 +146,59 @@ def process_dataset(local_folder, remote_path, dataset_name):
 # =============================================================================
 
 def main():
-    print("\n" + "="*70)
-    print("🚀 OMNISIGN-500M – GITHUB ACTIONS DATASET PIPELINE")
-    print("="*70)
-    print(f"📁 Target HF Repo: {REPO_ID}")
-    print(f"💾 Work directory: {WORK_DIR}")
-    print("="*70 + "\n")
+    log("\n" + "="*70)
+    log("🚀 OMNISIGN-500M – GITHUB ACTIONS DATASET PIPELINE (ROBUST)")
+    log("="*70)
+    log(f"📁 Target HF Repo: {REPO_ID}")
+    log(f"💾 Work directory: {WORK_DIR}")
+    log("="*70 + "\n")
 
     # Create work dir
     os.makedirs(WORK_DIR, exist_ok=True)
     os.makedirs(KAGGLE_DOWNLOADS, exist_ok=True)
 
     free = get_free_space_gb()
-    print(f"💾 Initial free space: {free} GB\n")
+    log(f"💾 Initial free space: {free} GB\n")
 
     for dataset_name, config in DATASETS.items():
-        print("\n" + "="*70)
-        print(f"📌 PROCESSING: {dataset_name.upper()}")
-        print("="*70)
+        log("\n" + "="*70)
+        log(f"📌 PROCESSING: {dataset_name.upper()}")
+        log("="*70)
 
         slug = config["slug"]
         remote_path = config["remote_path"]
         size_gb = config["size_gb"]
         output_dir = os.path.join(KAGGLE_DOWNLOADS, dataset_name)
 
-        # Check if we have enough space
+        # Check free space
         free = get_free_space_gb()
-        if free < size_gb * 1.2:  # 20% buffer
-            print(f"⚠️ Not enough free space! Need ~{size_gb * 1.2:.0f} GB, have {free} GB")
-            print("   Please free up space and re-run.")
+        if free < size_gb * 1.2:
+            log(f"⚠️ Not enough free space! Need ~{size_gb * 1.2:.0f} GB, have {free} GB")
+            log("   Please free up space and re-run.")
             sys.exit(1)
 
-        # Download dataset
-        if not download_dataset(slug, output_dir):
-            print(f"   ❌ Failed to download {dataset_name}")
+        # Download dataset using kagglehub
+        if not download_dataset_with_kagglehub(slug, output_dir):
+            log(f"   ❌ Failed to download {dataset_name}")
             continue
 
-        # Process files (upload one by one, delete after upload)
-        success = process_dataset(output_dir, remote_path, dataset_name)
+        # Process files
+        process_dataset(output_dir, remote_path, dataset_name)
 
-        # Delete the entire dataset folder to free space for the next dataset
-        print(f"\n🧹 Cleaning up {dataset_name}...")
+        # Clean up to free space
+        log(f"\n🧹 Cleaning up {dataset_name}...")
         shutil.rmtree(output_dir, ignore_errors=True)
-        print(f"   ✅ Deleted {output_dir}")
+        log(f"   ✅ Deleted {output_dir}")
 
         free = get_free_space_gb()
-        print(f"💾 Free space after {dataset_name}: {free} GB")
+        log(f"💾 Free space after {dataset_name}: {free} GB")
 
-    print("\n" + "="*70)
-    print("🎉 ALL DATASETS PROCESSED!")
-    print("="*70)
-    print(f"🔗 Check your repository: https://huggingface.co/datasets/{REPO_ID}")
+    log("\n" + "="*70)
+    log("🎉 ALL DATASETS PROCESSED!")
+    log("="*70)
+    log(f"🔗 Check your repository: https://huggingface.co/datasets/{REPO_ID}")
     free = get_free_space_gb()
-    print(f"💾 Final free space: {free} GB")
+    log(f"💾 Final free space: {free} GB")
 
 if __name__ == "__main__":
     main()
