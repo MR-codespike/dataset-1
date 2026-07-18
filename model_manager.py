@@ -1,19 +1,7 @@
 #!/usr/bin/env python3
 """
 Model Manager — GitHub Actions version
-========================================
-
-What this does:
-  1. Builds llama-server from source (CPU-only, portable build).
-  2. Downloads your 3 quantized GGUF models from Hugging Face.
-  3. Implements the "relay baton" pattern: only ONE model's llama-server
-     process is ever running at a time. Loading a new model kills the
-     previous one first, waits for RAM release, then starts the next.
-  4. Tests the full cycle: load Qwen2.5-3B -> chat -> unload -> load
-     terminal model -> chat -> unload -> load coder model -> chat -> unload.
-  5. Prints load times and RAM usage at each step.
-
-GitHub Actions optimized — reads HF_TOKEN from environment.
+Automatically discovers GGUF filenames from your repositories
 """
 
 import subprocess
@@ -25,7 +13,7 @@ import requests
 import psutil
 import json
 from pathlib import Path
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, list_repo_files
 
 # ============================================================================
 # CONFIG — read from environment (GitHub Secrets)
@@ -37,23 +25,20 @@ if not HF_TOKEN:
     print("❌ HF_TOKEN environment variable not set.")
     sys.exit(1)
 
-# Your actual models from the repo list
-MODELS = {
+# Model repositories (without filenames - we'll discover them)
+MODEL_REPOS = {
     "router": {
         "repo_id": "MR-CODESPIKE/Qwen2.5-3B-Instruct-GGUF-Q4_K_M",
-        "filename": "qwen2.5-3b-instruct-q4_k_m.gguf",
         "port": 8081,
         "context_size": 4096,
     },
     "terminal": {
         "repo_id": "MR-CODESPIKE/Qwen2.5-1.5B-Instruct-GGUF-Q4_K_M",
-        "filename": "qwen2.5-1.5b-instruct-q4_k_m.gguf",
         "port": 8082,
         "context_size": 2048,
     },
     "coder": {
         "repo_id": "MR-CODESPIKE/DeepSeek-R1-Distill-Qwen-1.5B-GGUF-Q4_K_M",
-        "filename": "deepseek-r1-distill-qwen-1.5b-q4_k_m.gguf",
         "port": 8083,
         "context_size": 4096,
     },
@@ -64,13 +49,59 @@ BASE_DIR = os.environ.get("GITHUB_WORKSPACE", os.getcwd())
 LLAMA_CPP_DIR = os.path.join(BASE_DIR, "llama.cpp")
 MODELS_DIR = os.path.join(BASE_DIR, "gguf_models")
 
-# For GitHub Actions, use a smaller build to save time
-USE_CACHE = os.environ.get("USE_LLAMA_CACHE", "true").lower() == "true"
-SERVER_STARTUP_TIMEOUT_SECONDS = 120  # Increased for slower GitHub Actions runners
+SERVER_STARTUP_TIMEOUT_SECONDS = 120
 SERVER_SHUTDOWN_TIMEOUT_SECONDS = 15
 
 # ============================================================================
-# STEP 1: Build llama-server from source (with caching)
+# STEP 0: Discover GGUF filenames from repositories
+# ============================================================================
+
+def discover_model_filenames():
+    """Find the first .gguf file in each model repository"""
+    models_config = {}
+    
+    print("🔍 Discovering GGUF files in your repositories...\n")
+    
+    for name, cfg in MODEL_REPOS.items():
+        repo_id = cfg["repo_id"]
+        print(f"📂 {name} ({repo_id})")
+        
+        try:
+            files = list_repo_files(repo_id, token=HF_TOKEN)
+            gguf_files = [f for f in files if f.endswith('.gguf')]
+            
+            if not gguf_files:
+                print(f"  ❌ No .gguf files found in {repo_id}")
+                print(f"  Available files: {', '.join(files[:5])}")
+                continue
+            
+            # Use the first .gguf file found
+            filename = gguf_files[0]
+            print(f"  ✅ Found: {filename}")
+            
+            models_config[name] = {
+                "repo_id": repo_id,
+                "filename": filename,
+                "port": cfg["port"],
+                "context_size": cfg["context_size"],
+                "local_path": None,  # Will be set after download
+            }
+            
+        except Exception as e:
+            print(f"  ❌ Error: {e}")
+            continue
+        
+        print()
+    
+    if not models_config:
+        print("❌ No GGUF models found in any repository!")
+        sys.exit(1)
+    
+    return models_config
+
+
+# ============================================================================
+# STEP 1: Build llama-server from source
 # ============================================================================
 
 def build_llama_server():
@@ -79,15 +110,6 @@ def build_llama_server():
         return True
 
     print("🔨 Building llama-server from source...")
-    
-    # Check if we should use cached build
-    if USE_CACHE:
-        cache_dir = "/opt/llama_cache"
-        if os.path.exists(f"{cache_dir}/build/bin/llama-server"):
-            print(f"📦 Using cached build from {cache_dir}")
-            os.symlink(f"{cache_dir}/build", f"{LLAMA_CPP_DIR}/build", target_is_directory=True)
-            return True
-
     print("📥 Cloning llama.cpp ...")
     subprocess.run(
         ["git", "clone", "--depth", "1", "https://github.com/ggml-org/llama.cpp", LLAMA_CPP_DIR],
@@ -117,12 +139,13 @@ def build_llama_server():
 
 
 # ============================================================================
-# STEP 2: Download the 3 GGUF models
+# STEP 2: Download the GGUF models
 # ============================================================================
 
-def download_models():
+def download_models(models_config):
     os.makedirs(MODELS_DIR, exist_ok=True)
-    for name, cfg in MODELS.items():
+    
+    for name, cfg in models_config.items():
         print(f"📥 Downloading {name} ({cfg['repo_id']}/{cfg['filename']}) ...")
         try:
             local_path = hf_hub_download(
@@ -133,15 +156,13 @@ def download_models():
                 local_dir_use_symlinks=False,
             )
             cfg["local_path"] = local_path
-            print(f"  ✅ -> {local_path}")
+            size_mb = os.path.getsize(local_path) / (1024 * 1024)
+            print(f"  ✅ -> {local_path} ({size_mb:.1f} MB)")
         except Exception as e:
             print(f"  ❌ Failed to download {name}: {e}")
             raise
     
-    # Print model sizes
-    for name, cfg in MODELS.items():
-        size_mb = os.path.getsize(cfg["local_path"]) / (1024 * 1024)
-        print(f"  📊 {name}: {size_mb:.1f} MB")
+    return models_config
 
 
 # ============================================================================
@@ -153,19 +174,12 @@ class ModelManagerError(Exception):
 
 
 class ModelManager:
-    """
-    Ensures only ONE model's llama-server process runs at a time.
-    Loading a different model kills the current one first, waits for the
-    port to actually free up (RAM release), then starts the new one.
-    """
-
     def __init__(self, models_config):
         self.models_config = models_config
         self.current_model_name = None
         self.current_process = None
 
     def _get_rss_mb(self, pid):
-        """Resident memory of a process tree, in MB."""
         try:
             proc = psutil.Process(pid)
             total = proc.memory_info().rss
@@ -214,7 +228,6 @@ class ModelManager:
         self.current_model_name = None
 
     def load(self, model_name):
-        """Loads model_name, unloading whatever is currently loaded first."""
         if self.current_model_name == model_name:
             print(f"  ⏭️  '{model_name}' already loaded, skipping reload.")
             return
@@ -231,7 +244,7 @@ class ModelManager:
             "--port", str(cfg["port"]),
             "--host", "127.0.0.1",
             "-c", str(cfg["context_size"]),
-            "--n-gpu-layers", "0",   # CPU-only target
+            "--n-gpu-layers", "0",
             "--threads", str(os.cpu_count() or 2),
         ]
 
@@ -257,7 +270,6 @@ class ModelManager:
         self.current_model_name = model_name
 
     def chat(self, model_name, user_message, max_tokens=200):
-        """Ensures model_name is loaded, then sends a chat completion request."""
         self.load(model_name)
         cfg = self.models_config[model_name]
         url = f"http://127.0.0.1:{cfg['port']}/v1/chat/completions"
@@ -295,6 +307,14 @@ def main():
     print("🚀 MODEL MANAGER — FULL RELAY TEST")
     print("="*60 + "\n")
 
+    # Discover model filenames
+    models_config = discover_model_filenames()
+    
+    print("📋 Models to use:")
+    for name, cfg in models_config.items():
+        print(f"  - {name}: {cfg['filename']} ({cfg['repo_id']})")
+    print()
+
     # Build llama-server
     if not build_llama_server():
         print("❌ Failed to build llama-server")
@@ -302,17 +322,17 @@ def main():
 
     # Download models
     print("\n📥 Downloading models...")
-    download_models()
+    models_config = download_models(models_config)
 
     # Initialize manager
-    manager = ModelManager(MODELS)
+    manager = ModelManager(models_config)
 
     # Test queries
     test_queries = [
         ("router", "Say hello in one short sentence.", 100),
         ("terminal", "What is the linux command to list all files in a directory?", 150),
-        ("coder", "Write a one-line python function that adds two numbers and returns the result.", 150),
-        ("router", "Say goodbye in one short sentence.", 100),  # Test swapping back
+        ("coder", "Write a one-line python function that adds two numbers.", 150),
+        ("router", "Say goodbye in one short sentence.", 100),
     ]
 
     print("\n" + "="*60)
@@ -358,7 +378,7 @@ def main():
             if not r["success"]:
                 print(f"  - Test {r['test']}: {r['model']} - {r.get('error', 'Unknown error')}")
     
-    print("\n✅ Test complete! Model manager ready for production.")
+    print("\n✅ Test complete!")
     sys.exit(0 if successful == len(results) else 1)
 
 
