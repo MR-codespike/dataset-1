@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """
-Router Classifier Test – Model Accuracy Only (No Terminal Hard-Rules)
-Tests the model's ability to distinguish: code vs terminal vs direct.
-Website is the only hard-rule (unambiguous).
+Router Classifier Test – Full Pipeline
+Clones llama.cpp, builds llama-server, downloads model, runs tests.
 """
 
 import os
-import subprocess
-import time
 import sys
-import json
+import time
+import subprocess
 import requests
-import threading
 import signal
+import shutil
 from pathlib import Path
 from huggingface_hub import hf_hub_download
 
@@ -22,16 +20,17 @@ from huggingface_hub import hf_hub_download
 
 MODEL_REPO = "MR-CODESPIKE/Qwen2.5-3B-Instruct-GGUF-Q4_K_M"
 MODEL_FILE = "Qwen2.5-3B-Instruct-Q4_K_M.gguf"
+LLAMA_CPP_DIR = "./llama.cpp"
+LLAMA_SERVER_BIN = f"{LLAMA_CPP_DIR}/llama-server"
 GGUF_DIR = "./gguf_models"
 LLAMA_SERVER_URL = "http://localhost:8080"
-LLAMA_SERVER_BIN = "./llama-server"
+
+# Website keywords (hard-rule only – unambiguous)
+WEBSITE_KEYWORDS = {"website", "landing page", "homepage", "portfolio site", "business site"}
 
 # =============================================================================
 # TEST CASES
 # =============================================================================
-
-# Hard-rule only for website (unambiguous)
-WEBSITE_KEYWORDS = {"website", "landing page", "homepage", "portfolio site", "business site"}
 
 TEST_CASES = [
     # WEBSITE (hard-rule only)
@@ -76,8 +75,46 @@ TEST_CASES = [
 ]
 
 # =============================================================================
-# HARD RULE CHECK
+# SETUP FUNCTIONS
 # =============================================================================
+
+def setup_llama_cpp():
+    """Clone and build llama.cpp."""
+    print("🔧 Setting up llama.cpp...")
+    
+    if os.path.exists(LLAMA_CPP_DIR):
+        print(f"   ✅ llama.cpp already exists at {LLAMA_CPP_DIR}")
+    else:
+        print("   📥 Cloning llama.cpp repository...")
+        subprocess.run(
+            ["git", "clone", "https://github.com/ggerganov/llama.cpp.git", LLAMA_CPP_DIR],
+            check=True
+        )
+        print("   ✅ Clone complete")
+    
+    # Check if server binary already exists
+    if os.path.exists(LLAMA_SERVER_BIN):
+        print(f"   ✅ llama-server already built at {LLAMA_SERVER_BIN}")
+        return
+    
+    # Build llama-server
+    print("   🔨 Building llama-server (this may take a few minutes)...")
+    os.chdir(LLAMA_CPP_DIR)
+    
+    # Try to build with make
+    try:
+        subprocess.run(["make", "llama-server"], check=True, capture_output=True)
+        print("   ✅ Build complete")
+    except subprocess.CalledProcessError as e:
+        print(f"   ❌ Build failed: {e.stderr.decode() if e.stderr else 'unknown error'}")
+        sys.exit(1)
+    finally:
+        os.chdir("..")
+    
+    # Verify binary exists
+    if not os.path.exists(LLAMA_SERVER_BIN):
+        print("   ❌ llama-server binary not found after build")
+        sys.exit(1)
 
 def check_hard_rule(query):
     """Only website keywords are hard-ruled (unambiguous)."""
@@ -85,10 +122,6 @@ def check_hard_rule(query):
     if any(keyword in query_lower for keyword in WEBSITE_KEYWORDS):
         return "website"
     return None
-
-# =============================================================================
-# MODEL INTERACTION
-# =============================================================================
 
 def query_model(query, max_retries=3):
     """Query the llama-server and get the routed category."""
@@ -112,9 +145,8 @@ Category:"""
                     "n_predict": 20,
                     "temperature": 0.1,
                     "stop": ["\n", "."],
-                    "max_tokens": 10,
                 },
-                timeout=10,
+                timeout=15,
             )
             if response.status_code == 200:
                 result = response.json().get("content", "").strip().lower()
@@ -123,14 +155,35 @@ Category:"""
                     if category in result:
                         return category
                 return result
+        except requests.exceptions.ConnectionError:
+            print(f"   ⚠️ Connection error (attempt {attempt+1}/{max_retries})...")
+            time.sleep(2)
         except Exception as e:
-            print(f"   ⚠️ Model query attempt {attempt+1} failed: {e}")
+            print(f"   ⚠️ Query error: {e}")
             time.sleep(1)
     
     return "error"
 
+def wait_for_server(max_wait=120):
+    """Wait for llama-server to be ready."""
+    print("   ⏳ Waiting for server to be ready...")
+    waited = 0
+    while waited < max_wait:
+        try:
+            response = requests.get(f"{LLAMA_SERVER_URL}/health", timeout=2)
+            if response.status_code == 200:
+                print("   ✅ Server ready")
+                return True
+        except:
+            pass
+        time.sleep(2)
+        waited += 2
+        if waited % 10 == 0:
+            print(f"   ⏳ Still waiting... ({waited}s)")
+    return False
+
 # =============================================================================
-# MAIN TEST
+# MAIN
 # =============================================================================
 
 def main():
@@ -141,10 +194,12 @@ def main():
     print("⚠️  Terminal, Code, Direct: ALL model-based")
     print("="*60 + "\n")
 
-    # Ensure model is downloaded and server is running
+    # Step 1: Setup llama.cpp
+    setup_llama_cpp()
+
+    # Step 2: Download model
+    print(f"\n🔍 Discovering GGUF file in {MODEL_REPO}...")
     os.makedirs(GGUF_DIR, exist_ok=True)
-    
-    print(f"🔍 Discovering GGUF file in {MODEL_REPO}...")
     try:
         model_path = hf_hub_download(
             repo_id=MODEL_REPO,
@@ -157,40 +212,27 @@ def main():
         print(f"❌ Failed to download model: {e}")
         sys.exit(1)
 
-    # Build llama-server if needed
-    if not os.path.exists(LLAMA_SERVER_BIN):
-        print("🔧 Building llama-server...")
-        subprocess.run(["make", "llama-server"], check=True)
-
-    # Start server
-    print("🚀 Starting router model server ...")
+    # Step 3: Start llama-server
+    print("\n🚀 Starting router model server ...")
     server_process = subprocess.Popen(
         [LLAMA_SERVER_BIN, "-m", model_path, "-c", "4096"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         preexec_fn=os.setsid if os.name != 'nt' else None,
     )
-    
-    # Wait for server to be ready
-    time.sleep(5)
-    max_wait = 60
-    while max_wait > 0:
-        try:
-            response = requests.get(f"{LLAMA_SERVER_URL}/health", timeout=2)
-            if response.status_code == 200:
-                print("✅ Router model ready.\n")
-                break
-        except:
-            pass
-        time.sleep(2)
-        max_wait -= 2
-    
-    if max_wait <= 0:
+
+    # Step 4: Wait for server
+    if not wait_for_server():
         print("❌ Server failed to start")
-        os.killpg(os.getpgid(server_process.pid), signal.SIGTERM)
+        try:
+            os.killpg(os.getpgid(server_process.pid), signal.SIGTERM)
+        except:
+            server_process.terminate()
         sys.exit(1)
 
-    # Run tests
+    print("✅ Router model ready.\n")
+
+    # Step 5: Run tests
     print("="*60)
     print("🧪 RUNNING ROUTING ACCURACY TEST")
     print("="*60 + "\n")
@@ -198,6 +240,8 @@ def main():
     passed = 0
     total = len(TEST_CASES)
     failures = []
+    hard_rule_count = 0
+    model_count = 0
 
     for test in TEST_CASES:
         query = test["query"]
@@ -208,13 +252,16 @@ def main():
         if hard_rule_result:
             result = hard_rule_result
             source = "hard_rule"
+            hard_rule_count += 1
         else:
             result = query_model(query)
             source = "model"
+            model_count += 1
         
         status = "✅" if result == expected else "❌"
         print(f'{status} "{query}"')
         print(f'    expected: {expected} | got: {result} ({source})')
+        print()
         
         if result == expected:
             passed += 1
@@ -222,8 +269,11 @@ def main():
             failures.append(f'"{query}" — expected {expected}, got {result}')
 
     # Print summary
-    print("\n" + "="*60)
+    print("="*60)
     print(f"📊 ACCURACY: {passed}/{total} ({int(passed/total*100)}%)")
+    print("="*60)
+    print(f"   Hard-rule cases: {hard_rule_count} (website only)")
+    print(f"   Model cases: {model_count} (terminal, code, direct)")
     print("="*60)
 
     if failures:
@@ -237,7 +287,7 @@ def main():
         print("   Model correctly distinguishes code vs terminal vs direct.")
         print("   Website hard-rule confirmed unambiguous.")
 
-    # Cleanup
+    # Step 6: Cleanup
     print("\n🔄 Shutting down router model server...")
     try:
         os.killpg(os.getpgid(server_process.pid), signal.SIGTERM)
