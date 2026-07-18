@@ -1,464 +1,250 @@
 #!/usr/bin/env python3
 """
-Router Classification — GitHub Actions version (v4)
-=====================================================
-
-Fixed: Expanded terminal keywords and improved prompt for command questions
+Router Classifier Test – Model Accuracy Only (No Terminal Hard-Rules)
+Tests the model's ability to distinguish: code vs terminal vs direct.
+Website is the only hard-rule (unambiguous).
 """
 
+import os
 import subprocess
 import time
-import os
 import sys
-import re
-import signal
+import json
 import requests
-import psutil
+import threading
+import signal
 from pathlib import Path
-from huggingface_hub import hf_hub_download, list_repo_files
+from huggingface_hub import hf_hub_download
 
-# ============================================================================
-# CONFIG — read from environment (GitHub Secrets)
-# ============================================================================
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
 
-HF_TOKEN = os.environ.get("HF_TOKEN")
+MODEL_REPO = "MR-CODESPIKE/Qwen2.5-3B-Instruct-GGUF-Q4_K_M"
+MODEL_FILE = "Qwen2.5-3B-Instruct-Q4_K_M.gguf"
+GGUF_DIR = "./gguf_models"
+LLAMA_SERVER_URL = "http://localhost:8080"
+LLAMA_SERVER_BIN = "./llama-server"
 
-if not HF_TOKEN:
-    print("❌ HF_TOKEN environment variable not set.")
-    sys.exit(1)
+# =============================================================================
+# TEST CASES
+# =============================================================================
 
-# Use GitHub workspace or current directory
-BASE_DIR = os.environ.get("GITHUB_WORKSPACE", os.getcwd())
-LLAMA_CPP_DIR = os.path.join(BASE_DIR, "llama.cpp")
-MODELS_DIR = os.path.join(BASE_DIR, "gguf_models")
+# Hard-rule only for website (unambiguous)
+WEBSITE_KEYWORDS = {"website", "landing page", "homepage", "portfolio site", "business site"}
 
-ROUTER_MODEL = {
-    "repo_id": "MR-CODESPIKE/Qwen2.5-3B-Instruct-GGUF-Q4_K_M",
-    "filename": None,  # Will be discovered
-    "port": 8081,
-    "context_size": 4096,
-}
-
-SERVER_STARTUP_TIMEOUT_SECONDS = 120
-
-# The hard rule — expanded with more keywords
-WEBSITE_KEYWORDS = [
-    "website", "web site", "webpage", "web page", "landing page",
-    "build me a site", "build a site", "my site", "homepage",
-    "create a website", "make a website", "website for",
-    "site for my", "web presence", "online presence",
+TEST_CASES = [
+    # WEBSITE (hard-rule only)
+    {"query": "Build me a website for a bakery", "expected": "website"},
+    {"query": "I need a landing page for my app", "expected": "website"},
+    {"query": "Can you make a homepage for my portfolio", "expected": "website"},
+    {"query": "Create a website for my coffee shop", "expected": "website"},
+    
+    # TERMINAL (model must classify these correctly)
+    {"query": "Install express using npm", "expected": "terminal"},
+    {"query": "Run the test suite", "expected": "terminal"},
+    {"query": "Start the development server", "expected": "terminal"},
+    {"query": "What's the command to list files", "expected": "terminal"},
+    {"query": "Stop the running process on port 8080", "expected": "terminal"},
+    {"query": "Kill the background job", "expected": "terminal"},
+    {"query": "Check the logs for errors", "expected": "terminal"},
+    {"query": "List all running containers", "expected": "terminal"},
+    
+    # CODE (model must classify these correctly)
+    {"query": "Write a function that reverses a string", "expected": "code"},
+    {"query": "Review this code for bugs", "expected": "code"},
+    {"query": "Fix the bug in my sorting algorithm", "expected": "code"},
+    {"query": "Debug why my API returns a 500 error", "expected": "code"},
+    {"query": "Optimize this SQL query", "expected": "code"},
+    {"query": "Add error handling to this function", "expected": "code"},
+    {"query": "What's wrong with this Python script", "expected": "code"},
+    
+    # ADVERSARIAL – These would break keyword-based routing
+    {"query": "Run a quick review of my code", "expected": "code"},
+    {"query": "Stop overthinking and just fix this bug", "expected": "code"},
+    {"query": "Can you start writing tests for my app", "expected": "code"},
+    {"query": "What's the best way to structure this command pattern", "expected": "code"},
+    
+    # DIRECT (model must classify these correctly)
+    {"query": "What does this error message mean", "expected": "direct"},
+    {"query": "Commit my changes with message 'fix typo'", "expected": "direct"},
+    {"query": "What files are in this project", "expected": "direct"},
+    {"query": "Explain what a REST API is", "expected": "direct"},
+    {"query": "Why is the sky blue", "expected": "direct"},
+    {"query": "What's the weather in London", "expected": "direct"},
+    {"query": "Tell me a joke", "expected": "direct"},
 ]
 
-# Terminal keywords for additional hard-rule checking
-TERMINAL_KEYWORDS = [
-    "command", "terminal", "shell", "install", "npm", "pip",
-    "run", "start", "stop", "restart", "execute",
-    "list files", "ls", "cd", "mkdir", "rm", "cp", "mv",
-]
+# =============================================================================
+# HARD RULE CHECK
+# =============================================================================
 
-# The GBNF grammar
-CLASSIFICATION_GRAMMAR = 'root ::= "terminal" | "code" | "direct"'
+def check_hard_rule(query):
+    """Only website keywords are hard-ruled (unambiguous)."""
+    query_lower = query.lower()
+    if any(keyword in query_lower for keyword in WEBSITE_KEYWORDS):
+        return "website"
+    return None
 
-# Even more explicit system prompt
-CLASSIFICATION_SYSTEM_PROMPT = """You are a request router. Classify the user's request into EXACTLY ONE category.
+# =============================================================================
+# MODEL INTERACTION
+# =============================================================================
 
-RULES (read carefully):
+def query_model(query, max_retries=3):
+    """Query the llama-server and get the routed category."""
+    prompt = f"""You are a router that classifies user requests into exactly one of these categories:
+- "code": When the user wants you to write, review, debug, or analyze code
+- "terminal": When the user wants to run a command, start/stop a service, or perform a terminal action
+- "direct": When the user asks a question that doesn't require code or terminal commands
+- "website": When the user specifically asks for a website, landing page, or homepage
 
-1. "terminal" = ANY question or request about:
-   - Running commands (ls, cd, mkdir, etc.)
-   - Installing packages (npm install, pip install, etc.)
-   - Starting/stopping servers or services
-   - Command-line operations
-   - Shell/terminal usage
-   
-   Examples: 
-   - "What's the command to list files" → terminal
-   - "Install express using npm" → terminal
-   - "How do I start the server" → terminal
+Respond with ONLY the category name (code, terminal, direct, or website).
 
-2. "code" = ANY question or request about:
-   - Writing, editing, or reviewing code
-   - Debugging or fixing code
-   - Programming concepts
-   - Algorithm implementation
-   
-   Examples:
-   - "Write a function that reverses a string" → code
-   - "Fix the bug in my sorting algorithm" → code
-   - "Debug why my API returns a 500 error" → code
+User request: "{query}"
+Category:"""
 
-3. "direct" = ANYTHING ELSE:
-   - General knowledge questions
-   - Git operations (commit, push, pull)
-   - File operations (read, write, list)
-   - Conversation or general help
-   - Weather, news, etc.
-   
-   Examples:
-   - "What does this error message mean" → direct
-   - "Commit my changes" → direct
-   - "What's the weather today" → direct
-
-Remember: If it's about commands, terminal, or installing → terminal
-Remember: If it's about writing or fixing code → code
-Remember: If it's general knowledge or file ops → direct
-
-Respond with ONLY ONE WORD: terminal, code, or direct."""
-
-
-# ============================================================================
-# STEP 0: Discover GGUF filename
-# ============================================================================
-
-def discover_model_filename():
-    """Find the first .gguf file in the router repository"""
-    print(f"🔍 Discovering GGUF file in {ROUTER_MODEL['repo_id']}...")
-    
-    try:
-        files = list_repo_files(ROUTER_MODEL["repo_id"], token=HF_TOKEN)
-        gguf_files = [f for f in files if f.endswith('.gguf')]
-        
-        if not gguf_files:
-            print(f"❌ No .gguf files found in {ROUTER_MODEL['repo_id']}")
-            print(f"   Available files: {', '.join(files[:5])}")
-            sys.exit(1)
-        
-        filename = gguf_files[0]
-        print(f"✅ Found: {filename}")
-        ROUTER_MODEL["filename"] = filename
-        return filename
-        
-    except Exception as e:
-        print(f"❌ Error discovering model: {e}")
-        sys.exit(1)
-
-
-# ============================================================================
-# STEP 1: Build llama-server
-# ============================================================================
-
-def build_llama_server():
-    if os.path.exists(f"{LLAMA_CPP_DIR}/build/bin/llama-server"):
-        print("✅ llama-server already built, skipping.")
-        return True
-
-    print("🔨 Building llama-server from source...")
-    print("📥 Cloning llama.cpp ...")
-    subprocess.run(
-        ["git", "clone", "--depth", "1", "https://github.com/ggml-org/llama.cpp", LLAMA_CPP_DIR],
-        check=True,
-        capture_output=True,
-    )
-
-    print("⚙️  Configuring build (CPU-only) ...")
-    subprocess.run(
-        ["cmake", "-B", "build", "-DCMAKE_BUILD_TYPE=Release", "-DGGML_NATIVE=OFF"],
-        cwd=LLAMA_CPP_DIR,
-        check=True,
-        capture_output=True,
-    )
-
-    print("🏗️  Building llama-server (this takes a few minutes) ...")
-    nproc = os.cpu_count() or 2
-    subprocess.run(
-        ["cmake", "--build", "build", "--target", "llama-server", "-j", str(min(nproc, 4))],
-        cwd=LLAMA_CPP_DIR,
-        check=True,
-        capture_output=True,
-    )
-    
-    print("✅ Build complete.")
-    return True
-
-
-# ============================================================================
-# STEP 2: Download router model
-# ============================================================================
-
-def download_model():
-    os.makedirs(MODELS_DIR, exist_ok=True)
-    
-    filename = ROUTER_MODEL["filename"]
-    print(f"📥 Downloading router model ({ROUTER_MODEL['repo_id']}/{filename}) ...")
-    
-    try:
-        local_path = hf_hub_download(
-            repo_id=ROUTER_MODEL["repo_id"],
-            filename=filename,
-            token=HF_TOKEN,
-            local_dir=MODELS_DIR,
-            local_dir_use_symlinks=False,
-        )
-        ROUTER_MODEL["local_path"] = local_path
-        size_mb = os.path.getsize(local_path) / (1024 * 1024)
-        print(f"  ✅ -> {local_path} ({size_mb:.1f} MB)")
-        return local_path
-    except Exception as e:
-        print(f"  ❌ Failed to download model: {e}")
-        sys.exit(1)
-
-
-# ============================================================================
-# STEP 3: Start the router model's llama-server
-# ============================================================================
-
-def wait_for_ready(port, timeout):
-    url = f"http://127.0.0.1:{port}/health"
-    start = time.time()
-    while time.time() - start < timeout:
+    for attempt in range(max_retries):
         try:
-            resp = requests.get(url, timeout=2)
-            if resp.status_code == 200:
-                return True
-        except requests.exceptions.RequestException:
-            pass
-        time.sleep(0.5)
-    return False
-
-
-def start_server(model_path):
-    print("🚀 Starting router model server ...")
-    
-    process = subprocess.Popen(
-        [
-            f"{LLAMA_CPP_DIR}/build/bin/llama-server",
-            "-m", model_path,
-            "--port", str(ROUTER_MODEL["port"]),
-            "--host", "127.0.0.1",
-            "-c", str(ROUTER_MODEL["context_size"]),
-            "--n-gpu-layers", "0",
-            "--threads", str(os.cpu_count() or 2),
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-    if not wait_for_ready(ROUTER_MODEL["port"], SERVER_STARTUP_TIMEOUT_SECONDS):
-        process.kill()
-        raise RuntimeError("Router model failed to start")
-    
-    print("✅ Router model ready.\n")
-    return process
-
-
-# ============================================================================
-# STEP 4: Hard rules (no model call)
-# ============================================================================
-
-def check_website_hard_rule(user_request):
-    lowered = user_request.lower()
-    for keyword in WEBSITE_KEYWORDS:
-        if keyword in lowered:
-            return True
-    return False
-
-def check_terminal_hard_rule(user_request):
-    """Additional hard rule for terminal commands (catch common patterns)"""
-    lowered = user_request.lower()
-    
-    # Pattern: "what's the command to [something]" or "command to [something]"
-    if re.search(r"what('s| is)? the command", lowered):
-        return True
-    if re.search(r"command to (list|show|display|find|search|delete|remove|copy|move)", lowered):
-        return True
-    
-    # Specific command keywords
-    for keyword in TERMINAL_KEYWORDS:
-        if keyword in lowered:
-            return True
-    return False
-
-
-# ============================================================================
-# STEP 5: Grammar-constrained classification with hard rules
-# ============================================================================
-
-class RoutingError(Exception):
-    pass
-
-
-def classify_request(user_request, max_retries=2):
-    """
-    Returns one of: "website", "terminal", "code", "direct".
-    Uses hard rules first, then falls back to model.
-    """
-    # Hard rule: website
-    if check_website_hard_rule(user_request):
-        return "website", "hard_rule"
-    
-    # Hard rule: terminal (catch common patterns)
-    if check_terminal_hard_rule(user_request):
-        return "terminal", "hard_rule"
-
-    url = f"http://127.0.0.1:{ROUTER_MODEL['port']}/v1/chat/completions"
-
-    last_error = None
-    for attempt in range(max_retries + 1):
-        try:
-            resp = requests.post(
-                url,
+            response = requests.post(
+                f"{LLAMA_SERVER_URL}/completion",
                 json={
-                    "model": "router",
-                    "messages": [
-                        {"role": "system", "content": CLASSIFICATION_SYSTEM_PROMPT},
-                        {"role": "user", "content": user_request},
-                    ],
+                    "prompt": prompt,
+                    "n_predict": 20,
+                    "temperature": 0.1,
+                    "stop": ["\n", "."],
                     "max_tokens": 10,
-                    "grammar": CLASSIFICATION_GRAMMAR,
-                    "temperature": 0.0,
                 },
-                timeout=30,
+                timeout=10,
             )
-            resp.raise_for_status()
-            data = resp.json()
-            category = data["choices"][0]["message"]["content"].strip()
+            if response.status_code == 200:
+                result = response.json().get("content", "").strip().lower()
+                # Extract just the category
+                for category in ["code", "terminal", "direct", "website"]:
+                    if category in result:
+                        return category
+                return result
+        except Exception as e:
+            print(f"   ⚠️ Model query attempt {attempt+1} failed: {e}")
+            time.sleep(1)
+    
+    return "error"
 
-            if category not in ("terminal", "code", "direct"):
-                raise RoutingError(f"Grammar constraint violated, got: {category!r}")
-
-            return category, "model"
-
-        except (requests.exceptions.RequestException, RoutingError, KeyError) as e:
-            last_error = e
-            if attempt < max_retries:
-                time.sleep(1)
-                continue
-
-    raise RoutingError(f"Classification failed after {max_retries + 1} attempts: {last_error}")
-
-
-# ============================================================================
-# STEP 6: Test batch
-# ============================================================================
-
-def run_tests():
-    TEST_CASES = [
-        # Website cases
-        ("Build me a website for a bakery", "website"),
-        ("I need a landing page for my app", "website"),
-        ("Can you make a homepage for my portfolio", "website"),
-        ("Create a website for my coffee shop", "website"),
-        ("I want a site for my business", "website"),
-        
-        # Terminal cases
-        ("Install express using npm", "terminal"),
-        ("Run the test suite", "terminal"),
-        ("Start the development server", "terminal"),
-        ("What's the command to list files", "terminal"),
-        ("Install python package requests", "terminal"),
-        ("How do I start the server", "terminal"),
-        ("What is the command to delete a file", "terminal"),  # Additional test
-        ("How to list all running processes", "terminal"),    # Additional test
-        
-        # Code cases
-        ("Write a function that reverses a string", "code"),
-        ("Review this code for bugs", "code"),
-        ("Fix the bug in my sorting algorithm", "code"),
-        ("Debug why my API returns a 500 error", "code"),
-        ("Help me fix this error in my code", "code"),
-        ("Why is my function not working", "code"),
-        ("Write a python script to parse JSON", "code"),
-        ("Can you help me debug this", "code"),
-        
-        # Direct cases
-        ("What does this error message mean", "direct"),
-        ("Commit my changes with message 'fix typo'", "direct"),
-        ("What files are in this project", "direct"),
-        ("Explain what a REST API is", "direct"),
-        ("Read the contents of config.json", "direct"),
-        ("What's the weather today", "direct"),
-    ]
-
-    print("="*60)
-    print("🧪 RUNNING ROUTING ACCURACY TEST (v4)")
-    print("="*60 + "\n")
-
-    correct = 0
-    total = len(TEST_CASES)
-    results = []
-
-    for user_request, expected in TEST_CASES:
-        try:
-            category, source = classify_request(user_request)
-            is_correct = category == expected
-            correct += is_correct
-            status = "✅" if is_correct else "❌"
-            print(f"{status} \"{user_request}\"")
-            print(f"    expected: {expected} | got: {category} ({source})")
-            results.append((user_request, expected, category, is_correct))
-        except RoutingError as e:
-            print(f"❌ \"{user_request}\" — ROUTING FAILED: {e}")
-            results.append((user_request, expected, "FAILED", False))
-
-    print(f"\n" + "="*60)
-    print(f"📊 ACCURACY: {correct}/{total} ({100*correct/total:.0f}%)")
-    print("="*60)
-
-    misses = [r for r in results if not r[3]]
-    if misses:
-        print(f"\n❌ {len(misses)} misclassification(s):")
-        for req, expected, got, _ in misses:
-            print(f"  \"{req}\" — expected {expected}, got {got}")
-            
-        # Show which categories are problematic
-        for category in ["website", "terminal", "code", "direct"]:
-            cat_misses = [r for r in misses if r[1] == category]
-            if cat_misses:
-                print(f"\n⚠️  {len(cat_misses)} {category}-related misclassifications:")
-                for req, expected, got, _ in cat_misses:
-                    print(f"  \"{req}\" → got {got}")
-    else:
-        print("\n✅ Perfect score! All classifications correct.")
-
-    return correct, total, results
-
-
-# ============================================================================
-# MAIN
-# ============================================================================
+# =============================================================================
+# MAIN TEST
+# =============================================================================
 
 def main():
     print("\n" + "="*60)
-    print("🚀 ROUTER CLASSIFIER v4 — GITHUB ACTIONS")
+    print("🚀 ROUTER CLASSIFIER — MODEL ACCURACY TEST")
+    print("="*60)
+    print("⚠️  Hard-rules: ONLY website (unambiguous)")
+    print("⚠️  Terminal, Code, Direct: ALL model-based")
     print("="*60 + "\n")
 
-    # Discover model filename
-    discover_model_filename()
-
-    # Build llama-server
-    if not build_llama_server():
-        print("❌ Failed to build llama-server")
+    # Ensure model is downloaded and server is running
+    os.makedirs(GGUF_DIR, exist_ok=True)
+    
+    print(f"🔍 Discovering GGUF file in {MODEL_REPO}...")
+    try:
+        model_path = hf_hub_download(
+            repo_id=MODEL_REPO,
+            filename=MODEL_FILE,
+            local_dir=GGUF_DIR,
+            local_dir_use_symlinks=False,
+        )
+        print(f"✅ Found: {os.path.basename(model_path)}")
+    except Exception as e:
+        print(f"❌ Failed to download model: {e}")
         sys.exit(1)
 
-    # Download model
-    model_path = download_model()
+    # Build llama-server if needed
+    if not os.path.exists(LLAMA_SERVER_BIN):
+        print("🔧 Building llama-server...")
+        subprocess.run(["make", "llama-server"], check=True)
 
     # Start server
-    server_process = start_server(model_path)
-
-    # Run tests
-    try:
-        correct, total, results = run_tests()
-    finally:
-        # Cleanup
-        print("\n🔄 Shutting down router model server...")
-        server_process.send_signal(signal.SIGTERM)
+    print("🚀 Starting router model server ...")
+    server_process = subprocess.Popen(
+        [LLAMA_SERVER_BIN, "-m", model_path, "-c", "4096"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        preexec_fn=os.setsid if os.name != 'nt' else None,
+    )
+    
+    # Wait for server to be ready
+    time.sleep(5)
+    max_wait = 60
+    while max_wait > 0:
         try:
-            server_process.wait(timeout=15)
-            print("✅ Server stopped.")
-        except subprocess.TimeoutExpired:
-            print("⚠️  Server didn't stop gracefully, force-killing...")
-            server_process.kill()
-            server_process.wait()
-
-    # Exit with appropriate code
-    if correct == total:
-        print("\n✅ All tests passed!")
-        sys.exit(0)
-    else:
-        print(f"\n⚠️  {total - correct} tests failed.")
+            response = requests.get(f"{LLAMA_SERVER_URL}/health", timeout=2)
+            if response.status_code == 200:
+                print("✅ Router model ready.\n")
+                break
+        except:
+            pass
+        time.sleep(2)
+        max_wait -= 2
+    
+    if max_wait <= 0:
+        print("❌ Server failed to start")
+        os.killpg(os.getpgid(server_process.pid), signal.SIGTERM)
         sys.exit(1)
 
+    # Run tests
+    print("="*60)
+    print("🧪 RUNNING ROUTING ACCURACY TEST")
+    print("="*60 + "\n")
+
+    passed = 0
+    total = len(TEST_CASES)
+    failures = []
+
+    for test in TEST_CASES:
+        query = test["query"]
+        expected = test["expected"]
+        
+        # Check hard-rule first
+        hard_rule_result = check_hard_rule(query)
+        if hard_rule_result:
+            result = hard_rule_result
+            source = "hard_rule"
+        else:
+            result = query_model(query)
+            source = "model"
+        
+        status = "✅" if result == expected else "❌"
+        print(f'{status} "{query}"')
+        print(f'    expected: {expected} | got: {result} ({source})')
+        
+        if result == expected:
+            passed += 1
+        else:
+            failures.append(f'"{query}" — expected {expected}, got {result}')
+
+    # Print summary
+    print("\n" + "="*60)
+    print(f"📊 ACCURACY: {passed}/{total} ({int(passed/total*100)}%)")
+    print("="*60)
+
+    if failures:
+        print(f"\n❌ {len(failures)} misclassification(s):")
+        for f in failures:
+            print(f"  {f}")
+        print("\n⚠️  Test failed.")
+        sys.exit(1)
+    else:
+        print("\n🎉 ALL TESTS PASSED!")
+        print("   Model correctly distinguishes code vs terminal vs direct.")
+        print("   Website hard-rule confirmed unambiguous.")
+
+    # Cleanup
+    print("\n🔄 Shutting down router model server...")
+    try:
+        os.killpg(os.getpgid(server_process.pid), signal.SIGTERM)
+    except:
+        server_process.terminate()
+    server_process.wait()
+    print("✅ Server stopped.")
 
 if __name__ == "__main__":
     main()
