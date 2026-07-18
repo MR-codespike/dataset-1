@@ -1,18 +1,11 @@
 #!/usr/bin/env python3
 """
-Full Orchestrator Integration Test — GitHub Actions version
+Full Orchestrator Integration Test — GitHub Actions version (FIXED)
 =============================================================
 
-Wires the PROVEN Agent Loop to the REAL components:
-  - Real Model Manager (load/unload relay across all 3 models)
-  - Real grammar-constrained router classification
-  - Real template retrieval (embedding search) + patch pipeline
-  - Real code-block extraction from the coder model
-
-This is the final integration test — everything before this validated one
-piece at a time; this proves they work together as a whole system.
-
-GitHub Actions optimized — reads HF_TOKEN from environment.
+Fixes:
+1. Website: Uses correct placeholder fields for the selected template
+2. Direct: Routes "direct" requests to the router model (not a separate model)
 """
 
 import subprocess
@@ -283,6 +276,10 @@ class ModelManager:
         print(f"  ✅ Loaded '{model_name}'")
 
     def chat(self, model_name, user_message, grammar=None):
+        # FIX: For "direct", use the router model (not a separate model)
+        if model_name == "direct":
+            model_name = "router"
+        
         self.load(model_name)
         cfg = self.models_config[model_name]
         max_tokens = MAX_TOKENS_BY_MODEL.get(model_name, 300)
@@ -326,6 +323,9 @@ def real_classifier(user_request, manager):
 # ============================================================================
 
 def real_model_chat(model_name, message, manager):
+    # FIX: For "direct", use the router model
+    if model_name == "direct":
+        model_name = "router"
     return manager.chat(model_name, message)
 
 # ============================================================================
@@ -433,23 +433,88 @@ def real_patch_template(match, business_data, templates_local_path):
     
     return html, css
 
-def integration_collect_business_data(match, user_request):
-    """For this automated integration test, business data is scripted."""
-    return {
+# ============================================================================
+# DYNAMIC BUSINESS DATA COLLECTION (matches the selected template)
+# ============================================================================
+
+def dynamic_collect_business_data(match, user_request):
+    """Collects business data dynamically based on the matched template."""
+    
+    # Load the template's meta.json to see what fields it expects
+    template_folder = Path(TEMPLATES_DIR) / match["path"]
+    with open(template_folder / "meta.json") as f:
+        meta = json.load(f)
+    
+    placeholders = meta["placeholders"]
+    scalar_fields = placeholders.get("scalar", [])
+    repeating_blocks = placeholders.get("repeating", {})
+    
+    print(f"  📋 Template expects: {', '.join(scalar_fields)}")
+    
+    # Build data dynamically based on what the template needs
+    business_data = {}
+    
+    # Common fields
+    field_map = {
         "business_name": "Riverside Bakery",
+        "shop_name": "Riverside Bakery",
         "tagline": "Fresh bread, baked every morning",
+        "shop_tagline": "Fresh bread, baked every morning",
         "about_text": "A small family bakery serving the neighborhood since 2015.",
+        "maker_name": "Sarah Miller",
+        "maker_story": "Baking has been my passion for 15 years. I started Riverside Bakery to share my love of sourdough with the community.",
         "phone_number": "555-0100",
+        "contact_email": "hello@riversidebakery.com",
         "address": "88 River Street",
         "hours_text": "Tue-Sun 7am-4pm",
         "primary_color": "#8b5a2b",
         "accent_color": "#d2a679",
         "map_embed_url": "https://maps.example.com/embed",
-        "menu_items": [
-            {"item_name": "Sourdough Loaf", "item_description": "Naturally leavened, 24hr ferment", "item_price": "$7"},
-            {"item_name": "Cinnamon Roll", "item_description": "Fresh baked, glazed", "item_price": "$4"},
-        ],
+        "instagram_handle": "@riversidebakery",
+        "twitter_handle": "@riversidebakery",
+        "facebook_handle": "riversidebakery",
     }
+    
+    # Fill scalar fields
+    for field in scalar_fields:
+        if field in field_map:
+            business_data[field] = field_map[field]
+        elif field == "business_type":
+            business_data[field] = "bakery"
+        elif field == "year_founded":
+            business_data[field] = "2015"
+        else:
+            # Default value for unknown fields
+            business_data[field] = f"{{{{ {field} }}}}"
+            print(f"  ⚠️  Unknown field: {field} using placeholder")
+    
+    # Fill repeating blocks
+    for block_name, block_info in repeating_blocks.items():
+        item_fields = block_info.get("fields", [])
+        
+        if block_name == "menu_items" or block_name == "products":
+            business_data[block_name] = [
+                {f: "Sourdough Loaf" if f == "item_name" or f == "product_name" else 
+                   "Naturally leavened, 24hr ferment" if f == "item_description" or f == "product_description" else 
+                   "$7" if f == "item_price" or f == "price" else 
+                   f"{{{{ {f} }}}}" for f in item_fields},
+                {f: "Cinnamon Roll" if f == "item_name" or f == "product_name" else 
+                   "Fresh baked, glazed" if f == "item_description" or f == "product_description" else 
+                   "$4" if f == "item_price" or f == "price" else 
+                   f"{{{{ {f} }}}}" for f in item_fields},
+            ]
+        elif block_name == "team_members":
+            business_data[block_name] = [
+                {f: "Sarah Miller" if f == "name" else "Head Baker" if f == "role" else f"{{{{ {f} }}}}" for f in item_fields},
+                {f: "James Chen" if f == "name" else "Pastry Chef" if f == "role" else f"{{{{ {f} }}}}" for f in item_fields},
+            ]
+        else:
+            # Default for unknown blocks
+            business_data[block_name] = [
+                {f: f"{{{{ {f} }}}}" for f in item_fields}
+            ]
+    
+    return business_data
 
 # ============================================================================
 # AGENT LOOP
@@ -517,7 +582,7 @@ class AgentLoop:
 
 def main():
     print("\n" + "="*60)
-    print("🚀 FULL ORCHESTRATOR INTEGRATION TEST")
+    print("🚀 FULL ORCHESTRATOR INTEGRATION TEST (FIXED)")
     print("="*60 + "\n")
     
     # Step 1: Discover models
@@ -546,7 +611,7 @@ def main():
         model_chat=real_model_chat,
         template_search=lambda req: real_template_search(req, embed_model, embeddings, template_metadata),
         patch_template=lambda match, data: real_patch_template(match, data, templates_local_path),
-        collect_business_data=integration_collect_business_data,
+        collect_business_data=dynamic_collect_business_data,
         extract_code_blocks=real_extract_code_blocks,
     )
     loop.manager = manager  # Inject manager reference
