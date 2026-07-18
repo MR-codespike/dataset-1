@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Router Classification — GitHub Actions version (v3)
+Router Classification — GitHub Actions version (v4)
 =====================================================
 
-Fixed: Much more explicit prompt with clear examples
-Added: More keywords for hard rule detection
+Fixed: Expanded terminal keywords and improved prompt for command questions
 """
 
 import subprocess
@@ -50,25 +49,59 @@ WEBSITE_KEYWORDS = [
     "site for my", "web presence", "online presence",
 ]
 
+# Terminal keywords for additional hard-rule checking
+TERMINAL_KEYWORDS = [
+    "command", "terminal", "shell", "install", "npm", "pip",
+    "run", "start", "stop", "restart", "execute",
+    "list files", "ls", "cd", "mkdir", "rm", "cp", "mv",
+]
+
 # The GBNF grammar
 CLASSIFICATION_GRAMMAR = 'root ::= "terminal" | "code" | "direct"'
 
-# Much more explicit system prompt with examples
+# Even more explicit system prompt
 CLASSIFICATION_SYSTEM_PROMPT = """You are a request router. Classify the user's request into EXACTLY ONE category.
 
-RULES:
-1. "terminal" = user wants to run commands, install packages, start servers, or use the command line.
-   Examples: "install npm", "run tests", "start server", "list files", "pip install"
+RULES (read carefully):
 
-2. "code" = user wants code written, fixed, debugged, or explained.
-   Examples: "write a function", "fix this bug", "debug my API", "review code", "why is my function not working"
+1. "terminal" = ANY question or request about:
+   - Running commands (ls, cd, mkdir, etc.)
+   - Installing packages (npm install, pip install, etc.)
+   - Starting/stopping servers or services
+   - Command-line operations
+   - Shell/terminal usage
+   
+   Examples: 
+   - "What's the command to list files" → terminal
+   - "Install express using npm" → terminal
+   - "How do I start the server" → terminal
 
-3. "direct" = general questions, git operations, file operations, or anything else.
-   Examples: "what does this error mean", "commit changes", "read file", "explain REST API", "weather"
+2. "code" = ANY question or request about:
+   - Writing, editing, or reviewing code
+   - Debugging or fixing code
+   - Programming concepts
+   - Algorithm implementation
+   
+   Examples:
+   - "Write a function that reverses a string" → code
+   - "Fix the bug in my sorting algorithm" → code
+   - "Debug why my API returns a 500 error" → code
 
-IMPORTANT: If it's about installing packages or running commands → terminal
-IMPORTANT: If it's about writing or fixing code → code
-IMPORTANT: If it's general knowledge or file operations → direct
+3. "direct" = ANYTHING ELSE:
+   - General knowledge questions
+   - Git operations (commit, push, pull)
+   - File operations (read, write, list)
+   - Conversation or general help
+   - Weather, news, etc.
+   
+   Examples:
+   - "What does this error message mean" → direct
+   - "Commit my changes" → direct
+   - "What's the weather today" → direct
+
+Remember: If it's about commands, terminal, or installing → terminal
+Remember: If it's about writing or fixing code → code
+Remember: If it's general knowledge or file ops → direct
 
 Respond with ONLY ONE WORD: terminal, code, or direct."""
 
@@ -209,7 +242,7 @@ def start_server(model_path):
 
 
 # ============================================================================
-# STEP 4: Hard rule — website detection (no model call)
+# STEP 4: Hard rules (no model call)
 # ============================================================================
 
 def check_website_hard_rule(user_request):
@@ -219,9 +252,25 @@ def check_website_hard_rule(user_request):
             return True
     return False
 
+def check_terminal_hard_rule(user_request):
+    """Additional hard rule for terminal commands (catch common patterns)"""
+    lowered = user_request.lower()
+    
+    # Pattern: "what's the command to [something]" or "command to [something]"
+    if re.search(r"what('s| is)? the command", lowered):
+        return True
+    if re.search(r"command to (list|show|display|find|search|delete|remove|copy|move)", lowered):
+        return True
+    
+    # Specific command keywords
+    for keyword in TERMINAL_KEYWORDS:
+        if keyword in lowered:
+            return True
+    return False
+
 
 # ============================================================================
-# STEP 5: Grammar-constrained classification with fallback
+# STEP 5: Grammar-constrained classification with hard rules
 # ============================================================================
 
 class RoutingError(Exception):
@@ -231,16 +280,15 @@ class RoutingError(Exception):
 def classify_request(user_request, max_retries=2):
     """
     Returns one of: "website", "terminal", "code", "direct".
+    Uses hard rules first, then falls back to model.
     """
-    # Hard rule first
+    # Hard rule: website
     if check_website_hard_rule(user_request):
         return "website", "hard_rule"
-
-    # Additional keyword-based pre-check for terminal to help the model
-    terminal_keywords = ["install", "npm", "pip", "command", "terminal", "shell", "run", "start"]
-    if any(kw in user_request.lower() for kw in terminal_keywords):
-        # Let the model decide, but we've already flagged it
-        pass
+    
+    # Hard rule: terminal (catch common patterns)
+    if check_terminal_hard_rule(user_request):
+        return "terminal", "hard_rule"
 
     url = f"http://127.0.0.1:{ROUTER_MODEL['port']}/v1/chat/completions"
 
@@ -299,6 +347,8 @@ def run_tests():
         ("What's the command to list files", "terminal"),
         ("Install python package requests", "terminal"),
         ("How do I start the server", "terminal"),
+        ("What is the command to delete a file", "terminal"),  # Additional test
+        ("How to list all running processes", "terminal"),    # Additional test
         
         # Code cases
         ("Write a function that reverses a string", "code"),
@@ -320,7 +370,7 @@ def run_tests():
     ]
 
     print("="*60)
-    print("🧪 RUNNING ROUTING ACCURACY TEST (v3)")
+    print("🧪 RUNNING ROUTING ACCURACY TEST (v4)")
     print("="*60 + "\n")
 
     correct = 0
@@ -369,7 +419,7 @@ def run_tests():
 
 def main():
     print("\n" + "="*60)
-    print("🚀 ROUTER CLASSIFIER v3 — GITHUB ACTIONS")
+    print("🚀 ROUTER CLASSIFIER v4 — GITHUB ACTIONS")
     print("="*60 + "\n")
 
     # Discover model filename
