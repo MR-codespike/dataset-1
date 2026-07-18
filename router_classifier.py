@@ -1,22 +1,10 @@
 #!/usr/bin/env python3
 """
-Router Classification — GitHub Actions version
+Router Classification — GitHub Actions version (v2)
 =====================================================
 
-What this does:
-  1. Applies the HARD RULE first: if the request contains website/site/
-     webpage keywords, it's classified as "website" WITHOUT calling any
-     model — this was always meant to be a cheap keyword check, not a
-     model decision (per the original design).
-  2. For everything else, loads the router model (Qwen2.5-3B) and asks
-     it to classify into exactly one of: "terminal", "code", "direct".
-  3. Uses a raw GBNF grammar to constrain the model's output to ONLY
-     one of those 3 words — not JSON, not a sentence, literally nothing
-     else is possible to sample.
-  4. Runs a batch of test prompts covering all 4 categories and reports
-     accuracy against the expected answer for each.
-
-GitHub Actions optimized — reads HF_TOKEN from environment.
+Fixed: Better prompt to catch debugging/error-fixing requests as "code"
+Added: More test cases for edge cases
 """
 
 import subprocess
@@ -64,15 +52,24 @@ WEBSITE_KEYWORDS = [
 # The GBNF grammar — mechanically restricts output to exactly one of these 3 words
 CLASSIFICATION_GRAMMAR = 'root ::= "terminal" | "code" | "direct"'
 
+# Improved system prompt - explicitly mentions debugging as code
 CLASSIFICATION_SYSTEM_PROMPT = """You are a request router for a coding assistant. Classify the user's \
 request into exactly one category:
 
 - "terminal": the user wants to run a shell/OS command, install a package, \
-start a server, or otherwise interact with the command line.
+start a server, or otherwise interact with the command line. Keywords: install, run, start, command, terminal, shell, npm, pip.
+
 - "code": the user wants code written, edited, reviewed, debugged, or \
-explained — anything involving actual programming logic.
+explained — anything involving actual programming logic. This includes: \
+writing functions, fixing bugs, debugging errors, reviewing code, \
+explaining code, or any programming-related task.
+
 - "direct": anything else — general questions, git operations, simple \
-file reads, conversation, or requests that don't need a specialist model.
+file reads, conversation, reading files, committing changes, or requests \
+that don't need code or terminal commands.
+
+IMPORTANT: If the user is asking to debug, fix, or troubleshoot code, \
+or if they mention an error, bug, or API issue, classify as "code".
 
 Respond with ONLY the category word, nothing else."""
 
@@ -279,7 +276,7 @@ def classify_request(user_request, max_retries=2):
 
 
 # ============================================================================
-# STEP 6: Test batch
+# STEP 6: Test batch (expanded with more edge cases)
 # ============================================================================
 
 def run_tests():
@@ -289,28 +286,37 @@ def run_tests():
         ("I need a landing page for my app", "website"),
         ("Can you make a homepage for my portfolio", "website"),
         ("Create a website for my coffee shop", "website"),
+        ("I want a site for my business", "website"),
         
         # Terminal cases
         ("Install express using npm", "terminal"),
         ("Run the test suite", "terminal"),
         ("Start the development server", "terminal"),
         ("What's the command to list files", "terminal"),
+        ("Install python package requests", "terminal"),
+        ("How do I start the server", "terminal"),
         
-        # Code cases
+        # Code cases (including debugging)
         ("Write a function that reverses a string", "code"),
         ("Review this code for bugs", "code"),
         ("Fix the bug in my sorting algorithm", "code"),
         ("Debug why my API returns a 500 error", "code"),
+        ("Help me fix this error in my code", "code"),
+        ("Why is my function not working", "code"),
+        ("Write a python script to parse JSON", "code"),
+        ("Can you help me debug this", "code"),
         
         # Direct cases
         ("What does this error message mean", "direct"),
         ("Commit my changes with message 'fix typo'", "direct"),
         ("What files are in this project", "direct"),
         ("Explain what a REST API is", "direct"),
+        ("Read the contents of config.json", "direct"),
+        ("What's the weather today", "direct"),
     ]
 
     print("="*60)
-    print("🧪 RUNNING ROUTING ACCURACY TEST")
+    print("🧪 RUNNING ROUTING ACCURACY TEST (v2)")
     print("="*60 + "\n")
 
     correct = 0
@@ -339,6 +345,13 @@ def run_tests():
         print(f"\n❌ {len(misses)} misclassification(s):")
         for req, expected, got, _ in misses:
             print(f"  \"{req}\" — expected {expected}, got {got}")
+            
+        # Show which categories are problematic
+        code_misses = [r for r in misses if r[1] == "code"]
+        if code_misses:
+            print(f"\n⚠️  {len(code_misses)} code-related misclassifications:")
+            for req, expected, got, _ in code_misses:
+                print(f"  \"{req}\" → got {got}")
     else:
         print("\n✅ Perfect score! All classifications correct.")
 
@@ -351,7 +364,7 @@ def run_tests():
 
 def main():
     print("\n" + "="*60)
-    print("🚀 ROUTER CLASSIFIER — GITHUB ACTIONS")
+    print("🚀 ROUTER CLASSIFIER v2 — GITHUB ACTIONS")
     print("="*60 + "\n")
 
     # Discover model filename
