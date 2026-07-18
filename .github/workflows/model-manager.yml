@@ -1,0 +1,57 @@
+name: Model Manager Test
+
+on:
+  workflow_dispatch:  # manual trigger only (builds take ~10-15 min)
+
+jobs:
+  test-model-manager:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake build-essential
+          pip install -q huggingface_hub requests psutil
+
+      - name: Cache llama.cpp build
+        uses: actions/cache@v4
+        id: llama-cache
+        with:
+          path: llama.cpp/build
+          key: llama-build-${{ runner.os }}-${{ hashFiles('llama.cpp/**') }}
+          restore-keys: |
+            llama-build-${{ runner.os }}-
+
+      - name: Cache GGUF models
+        uses: actions/cache@v4
+        id: model-cache
+        with:
+          path: gguf_models/
+          key: models-${{ hashFiles('model_manager.py') }}
+          restore-keys: |
+            models-
+
+      - name: Run model manager test
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          USE_LLAMA_CACHE: true
+        run: python model_manager.py
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: model-manager-results
+          path: |
+            gguf_models/
+            llama.cpp/build/bin/llama-server
+          retention-days: 3
