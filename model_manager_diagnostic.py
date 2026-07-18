@@ -3,7 +3,7 @@
 Model Manager — Diagnostic Mode
 ================================
 Tests the coder model and dumps full raw response to diagnose
-<think> tag handling without relying on truncated output.
+output format without relying on truncated logs.
 """
 
 import subprocess
@@ -27,7 +27,7 @@ if not HF_TOKEN:
     print("❌ HF_TOKEN environment variable not set.")
     sys.exit(1)
 
-# Model configurations
+# Model configurations (without filenames - we'll discover them)
 MODEL_REPOS = {
     "router": {
         "repo_id": "MR-CODESPIKE/Qwen2.5-3B-Instruct-GGUF-Q4_K_M",
@@ -348,6 +348,7 @@ def main():
     print(f"  Contains '</think>' tag: {'</think>' in raw_content}")
     print(f"  Contains '###' markdown: {'###' in raw_content}")
     print(f"  Contains '```' code block: {'```' in raw_content}")
+    print(f"  Contains 'def ' function definition: {'def ' in raw_content}")
     
     # Count think tags if present
     if '<think>' in raw_content:
