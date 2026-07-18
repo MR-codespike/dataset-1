@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Router Classification — GitHub Actions version (v2)
+Router Classification — GitHub Actions version (v3)
 =====================================================
 
-Fixed: Better prompt to catch debugging/error-fixing requests as "code"
-Added: More test cases for edge cases
+Fixed: Much more explicit prompt with clear examples
+Added: More keywords for hard rule detection
 """
 
 import subprocess
@@ -42,36 +42,35 @@ ROUTER_MODEL = {
 
 SERVER_STARTUP_TIMEOUT_SECONDS = 120
 
-# The hard rule — checked BEFORE any model call
+# The hard rule — expanded with more keywords
 WEBSITE_KEYWORDS = [
     "website", "web site", "webpage", "web page", "landing page",
     "build me a site", "build a site", "my site", "homepage",
     "create a website", "make a website", "website for",
+    "site for my", "web presence", "online presence",
 ]
 
-# The GBNF grammar — mechanically restricts output to exactly one of these 3 words
+# The GBNF grammar
 CLASSIFICATION_GRAMMAR = 'root ::= "terminal" | "code" | "direct"'
 
-# Improved system prompt - explicitly mentions debugging as code
-CLASSIFICATION_SYSTEM_PROMPT = """You are a request router for a coding assistant. Classify the user's \
-request into exactly one category:
+# Much more explicit system prompt with examples
+CLASSIFICATION_SYSTEM_PROMPT = """You are a request router. Classify the user's request into EXACTLY ONE category.
 
-- "terminal": the user wants to run a shell/OS command, install a package, \
-start a server, or otherwise interact with the command line. Keywords: install, run, start, command, terminal, shell, npm, pip.
+RULES:
+1. "terminal" = user wants to run commands, install packages, start servers, or use the command line.
+   Examples: "install npm", "run tests", "start server", "list files", "pip install"
 
-- "code": the user wants code written, edited, reviewed, debugged, or \
-explained — anything involving actual programming logic. This includes: \
-writing functions, fixing bugs, debugging errors, reviewing code, \
-explaining code, or any programming-related task.
+2. "code" = user wants code written, fixed, debugged, or explained.
+   Examples: "write a function", "fix this bug", "debug my API", "review code", "why is my function not working"
 
-- "direct": anything else — general questions, git operations, simple \
-file reads, conversation, reading files, committing changes, or requests \
-that don't need code or terminal commands.
+3. "direct" = general questions, git operations, file operations, or anything else.
+   Examples: "what does this error mean", "commit changes", "read file", "explain REST API", "weather"
 
-IMPORTANT: If the user is asking to debug, fix, or troubleshoot code, \
-or if they mention an error, bug, or API issue, classify as "code".
+IMPORTANT: If it's about installing packages or running commands → terminal
+IMPORTANT: If it's about writing or fixing code → code
+IMPORTANT: If it's general knowledge or file operations → direct
 
-Respond with ONLY the category word, nothing else."""
+Respond with ONLY ONE WORD: terminal, code, or direct."""
 
 
 # ============================================================================
@@ -222,7 +221,7 @@ def check_website_hard_rule(user_request):
 
 
 # ============================================================================
-# STEP 5: Grammar-constrained classification
+# STEP 5: Grammar-constrained classification with fallback
 # ============================================================================
 
 class RoutingError(Exception):
@@ -232,11 +231,16 @@ class RoutingError(Exception):
 def classify_request(user_request, max_retries=2):
     """
     Returns one of: "website", "terminal", "code", "direct".
-    Website is caught by the hard rule (no model call). Everything else
-    goes through the grammar-constrained router model call.
     """
+    # Hard rule first
     if check_website_hard_rule(user_request):
         return "website", "hard_rule"
+
+    # Additional keyword-based pre-check for terminal to help the model
+    terminal_keywords = ["install", "npm", "pip", "command", "terminal", "shell", "run", "start"]
+    if any(kw in user_request.lower() for kw in terminal_keywords):
+        # Let the model decide, but we've already flagged it
+        pass
 
     url = f"http://127.0.0.1:{ROUTER_MODEL['port']}/v1/chat/completions"
 
@@ -276,12 +280,12 @@ def classify_request(user_request, max_retries=2):
 
 
 # ============================================================================
-# STEP 6: Test batch (expanded with more edge cases)
+# STEP 6: Test batch
 # ============================================================================
 
 def run_tests():
     TEST_CASES = [
-        # Website cases (should all be caught by hard rule)
+        # Website cases
         ("Build me a website for a bakery", "website"),
         ("I need a landing page for my app", "website"),
         ("Can you make a homepage for my portfolio", "website"),
@@ -296,7 +300,7 @@ def run_tests():
         ("Install python package requests", "terminal"),
         ("How do I start the server", "terminal"),
         
-        # Code cases (including debugging)
+        # Code cases
         ("Write a function that reverses a string", "code"),
         ("Review this code for bugs", "code"),
         ("Fix the bug in my sorting algorithm", "code"),
@@ -316,7 +320,7 @@ def run_tests():
     ]
 
     print("="*60)
-    print("🧪 RUNNING ROUTING ACCURACY TEST (v2)")
+    print("🧪 RUNNING ROUTING ACCURACY TEST (v3)")
     print("="*60 + "\n")
 
     correct = 0
@@ -347,11 +351,12 @@ def run_tests():
             print(f"  \"{req}\" — expected {expected}, got {got}")
             
         # Show which categories are problematic
-        code_misses = [r for r in misses if r[1] == "code"]
-        if code_misses:
-            print(f"\n⚠️  {len(code_misses)} code-related misclassifications:")
-            for req, expected, got, _ in code_misses:
-                print(f"  \"{req}\" → got {got}")
+        for category in ["website", "terminal", "code", "direct"]:
+            cat_misses = [r for r in misses if r[1] == category]
+            if cat_misses:
+                print(f"\n⚠️  {len(cat_misses)} {category}-related misclassifications:")
+                for req, expected, got, _ in cat_misses:
+                    print(f"  \"{req}\" → got {got}")
     else:
         print("\n✅ Perfect score! All classifications correct.")
 
@@ -364,7 +369,7 @@ def run_tests():
 
 def main():
     print("\n" + "="*60)
-    print("🚀 ROUTER CLASSIFIER v2 — GITHUB ACTIONS")
+    print("🚀 ROUTER CLASSIFIER v3 — GITHUB ACTIONS")
     print("="*60 + "\n")
 
     # Discover model filename
