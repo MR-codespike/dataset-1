@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
 """
-Router Classification — GitHub Actions version (v5)
+Router Classification — GitHub Actions version (v6)
 =====================================================
 
 Design:
 - Hard-rule: ONLY website (unambiguous, cheap to detect)
 - Terminal, Code, Direct: ALL model-based with grammar constraints
 - No generic terminal keywords (run, start, stop, install, command)
-  These would misfire on ordinary English ("run a review", "start writing tests")
 
-What this tests:
-- Model's REAL accuracy on the boundary that matters (terminal vs code vs direct)
-- Website is hard-ruled (trivial)
-- All other decisions come from the model with grammar constraints
+Goal: 100% accuracy on model-based classification
 """
 
 import subprocess
@@ -67,24 +63,29 @@ WEBSITE_KEYWORDS = [
 
 CLASSIFICATION_GRAMMAR = 'root ::= "terminal" | "code" | "direct"'
 
-# Clean, focused system prompt with examples
+# Clean, focused system prompt with git operations explicitly in "direct"
 CLASSIFICATION_SYSTEM_PROMPT = """You are a request router. Classify the user's request into EXACTLY ONE category.
 
 RULES:
 
 1. "terminal" = ANYTHING about running commands, installing packages, starting/stopping services, or shell/terminal operations.
-   Examples: "install npm", "run the test suite", "start the server", "list files", "stop the process"
+   Examples: "install npm", "run the test suite", "start the server", "list files", "stop the process", "kill the job"
 
 2. "code" = ANYTHING about writing, reviewing, debugging, or explaining code/programming.
    Examples: "write a function", "fix this bug", "review my code", "debug this error", "optimize this query"
 
-3. "direct" = ANYTHING ELSE. General questions, git ops, file ops, conversation, knowledge queries.
-   Examples: "what does this error mean", "commit changes", "explain REST API", "what's the weather"
+3. "direct" = ANYTHING ELSE. This includes:
+   - General questions ("what does this error mean", "explain REST API")
+   - Git operations ("commit changes", "push", "pull", "merge") ← IMPORTANT: Git = direct, not terminal
+   - File operations ("read file", "list files" is terminal, but "show me the file" is direct)
+   - Conversation ("tell me a joke", "what's the weather")
+   - Knowledge queries ("why is the sky blue")
 
-IMPORTANT: 
-- If it's about commands or installing → terminal
-- If it's about writing or fixing code → code
-- Everything else → direct
+IMPORTANT DISTINCTIONS:
+- "list files" (shell command) → terminal
+- "what files are in this project" (question) → direct
+- "commit changes" (git) → direct
+- "install npm" (package) → terminal
 
 Respond with ONLY ONE WORD: terminal, code, or direct."""
 
@@ -310,10 +311,10 @@ def run_tests():
         ("Add error handling to this function", "code"),
         
         # ADVERSARIAL (would break keyword-based routing)
-        ("Run a quick review of my code", "code"),          # "run" → would be terminal
-        ("Stop overthinking and just fix this bug", "code"), # "stop" → would be terminal
-        ("Can you start writing tests for my app", "code"),  # "start" → would be terminal
-        ("What's the best way to structure this command pattern in my code", "code"),  # "command" → would be terminal
+        ("Run a quick review of my code", "code"),
+        ("Stop overthinking and just fix this bug", "code"),
+        ("Can you start writing tests for my app", "code"),
+        ("What's the best way to structure this command pattern in my code", "code"),
         
         # DIRECT (model)
         ("What does this error message mean", "direct"),
@@ -327,11 +328,11 @@ def run_tests():
     ]
 
     print("="*60)
-    print("🧪 ROUTING ACCURACY TEST (v5)")
+    print("🧪 ROUTING ACCURACY TEST (v6)")
     print("="*60)
     print("⚠️  Hard-rule: ONLY website (unambiguous)")
     print("⚠️  Terminal, Code, Direct: ALL model-based")
-    print("⚠️  No generic terminal keywords (run, start, stop, etc.)")
+    print("⚠️  Git operations explicitly classified as 'direct'")
     print("="*60 + "\n")
 
     correct = 0
@@ -381,13 +382,15 @@ def run_tests():
                 print(f"\n⚠️  {len(cat_failures)} {cat} failures:")
                 for req, expected, got, _ in cat_failures:
                     print(f'  "{req}" → got {got}')
+        
+        return False, correct, total
     else:
         print("\n🎉 ALL TESTS PASSED!")
         print("   Model correctly distinguishes terminal vs code vs direct.")
         print("   Website hard-rule confirmed unambiguous.")
+        print("   Git operations correctly classified as 'direct'.")
         print("   No generic keywords used in hard-rules.")
-
-    return correct, total, results
+        return True, correct, total
 
 
 # ============================================================================
@@ -396,7 +399,7 @@ def run_tests():
 
 def main():
     print("\n" + "="*60)
-    print("🚀 ROUTER CLASSIFIER v5")
+    print("🚀 ROUTER CLASSIFIER v6")
     print("="*60 + "\n")
 
     # Discover model
@@ -415,7 +418,7 @@ def main():
 
     # Run tests
     try:
-        correct, total, results = run_tests()
+        all_passed, correct, total = run_tests()
     finally:
         # Cleanup
         print("\n🔄 Shutting down server...")
@@ -429,7 +432,7 @@ def main():
             server_process.wait()
 
     # Exit
-    if correct == total:
+    if all_passed:
         print("\n✅ All tests passed!")
         sys.exit(0)
     else:
