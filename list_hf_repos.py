@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
-List all Hugging Face repositories (datasets, models, spaces) that you have access to.
-Useful to verify your HF_TOKEN works and see all your repos.
-
-GitHub Actions optimized version – reads HF_TOKEN from environment.
+List ALL repositories YOU own on Hugging Face (not all repos in the hub).
+This only lists repositories where you are the author/owner.
 """
 
 import os
@@ -11,145 +9,132 @@ import sys
 import json
 from huggingface_hub import HfApi
 
-# Read from environment (GitHub Secrets)
+# Read from environment
 HF_TOKEN = os.environ.get("HF_TOKEN")
 
 if not HF_TOKEN:
     print("❌ HF_TOKEN environment variable not set.")
-    print("⚠️  Falling back to token from huggingface-cli login...")
-    # Try to use the token from huggingface-cli login (if any)
-    try:
-        from huggingface_hub import HfFolder
-        HF_TOKEN = HfFolder.get_token()
-    except:
-        pass
-
-if not HF_TOKEN:
-    print("❌ No token found. Please set HF_TOKEN environment variable.")
     sys.exit(1)
 
 print(f"🔑 Token found (starts with: {HF_TOKEN[:8]}...)")
 
 # ============================================================================
-# List all repositories
+# Get your user info
 # ============================================================================
 
 api = HfApi(token=HF_TOKEN)
 
-print("\n📊 Fetching all your Hugging Face repositories...\n")
+print("📊 Fetching your Hugging Face repositories...")
 
-# Get all repos (datasets, models, spaces)
+# Get your username from the token
+try:
+    user_info = api.whoami(token=HF_TOKEN)
+    username = user_info.get("name")
+    print(f"👤 Logged in as: {username}\n")
+except Exception as e:
+    print(f"⚠️  Could not get username: {e}")
+    username = None
+
+# ============================================================================
+# List ONLY your repositories
+# ============================================================================
+
 all_repos = []
 
-# The HfApi has methods for each repo type
+# For each repo type, list ONLY repos where you are the author
 repo_types = [
-    ("dataset", api.list_datasets),
-    ("model", api.list_models),
-    ("space", api.list_spaces)
+    ("dataset", api.list_datasets, "datasets"),
+    ("model", api.list_models, "models"),
+    ("space", api.list_spaces, "spaces")
 ]
 
-for repo_type, list_func in repo_types:
+for repo_type, list_func, display_name in repo_types:
     try:
-        # Use list_func with token
-        for repo in list_func(token=HF_TOKEN):
-            # Get additional info if available
-            repo_id = repo.repo_id if hasattr(repo, 'repo_id') else repo.id
-            # Some versions use different attribute names
-            repo_name = repo_id.split('/')[-1] if '/' in repo_id else repo_id
-            
+        print(f"  Fetching your {display_name}...")
+        # Get repos with author filter
+        repos = list_func(
+            token=HF_TOKEN,
+            author=username if username else None
+        )
+        
+        count = 0
+        for repo in repos:
+            # Get repo ID properly
+            repo_id = getattr(repo, 'repo_id', getattr(repo, 'id', None))
+            if not repo_id:
+                continue
+                
             repo_data = {
-                "name": repo_name,
+                "name": repo_id.split('/')[-1] if '/' in repo_id else repo_id,
                 "full_name": repo_id,
                 "type": repo_type,
                 "private": getattr(repo, 'private', False),
                 "downloads": getattr(repo, 'downloads', 0),
                 "likes": getattr(repo, 'likes', 0),
-                "created_at": str(getattr(repo, 'created_at', 'N/A')),
                 "url": f"https://huggingface.co/{repo_id}"
             }
             all_repos.append(repo_data)
+            count += 1
+        
+        print(f"    Found {count} {display_name}")
     except Exception as e:
-        print(f"⚠️  Error fetching {repo_type}s: {e}")
-
-# Sort by repo type and name
-all_repos.sort(key=lambda x: (x["type"], x["full_name"]))
+        print(f"⚠️  Error fetching {display_name}: {e}")
 
 # ============================================================================
 # Display results
 # ============================================================================
 
+print(f"\n{'='*50}")
+print(f"✅ Found {len(all_repos)} repositories in total")
+print('='*50)
+
 if not all_repos:
-    print("No repositories found. Have you created any?")
+    print("\nNo repositories found. You haven't created any yet.")
     sys.exit(0)
 
-print(f"✅ Found {len(all_repos)} repositories:\n")
-
-# Group by type
-datasets = [r for r in all_repos if r["type"] == "dataset"]
-models = [r for r in all_repos if r["type"] == "model"]
-spaces = [r for r in all_repos if r["type"] == "space"]
-
-def print_repo_group(repos, type_name):
+# Group and display
+for repo_type in ["dataset", "model", "space"]:
+    repos = [r for r in all_repos if r["type"] == repo_type]
     if not repos:
-        return
-    print(f"\n{'='*50}")
-    print(f"📁 {type_name.upper()}S ({len(repos)})")
-    print('='*50)
+        continue
+    
+    type_display = repo_type.upper()
+    if repo_type == "space":
+        type_display = "SPACES"
+    elif repo_type == "dataset":
+        type_display = "DATASETS"
+    elif repo_type == "model":
+        type_display = "MODELS"
+    
+    print(f"\n📁 {type_display} ({len(repos)})")
+    print("-" * 40)
+    
     for repo in repos:
         private_marker = "🔒" if repo["private"] else "🌐"
         print(f"{private_marker} {repo['full_name']}")
         print(f"   URL: {repo['url']}")
         if repo['downloads'] > 0 or repo['likes'] > 0:
             print(f"   📥 {repo['downloads']} downloads | ❤️ {repo['likes']} likes")
-        print(f"   📅 Created: {repo['created_at']}")
-
-print_repo_group(datasets, "Dataset")
-print_repo_group(models, "Model")
-print_repo_group(spaces, "Space")
+        print()
 
 # ============================================================================
-# Save paths to a file (useful for scripts)
+# Save to file (for GitHub Actions artifact)
 # ============================================================================
 
-print(f"\n{'='*50}")
-print("📝 Full repository list (raw data):")
-print('='*50)
-
-# Print as JSON for easy parsing
-print(json.dumps(all_repos, indent=2, default=str))
-
-# Also save to file if running in GitHub Actions
 if os.environ.get("GITHUB_WORKSPACE"):
     output_path = os.path.join(os.environ["GITHUB_WORKSPACE"], "hf_repos.json")
     with open(output_path, "w") as f:
         json.dump(all_repos, f, indent=2, default=str)
-    print(f"\n✅ Saved to {output_path}")
+    print(f"✅ Saved to {output_path}")
 
 # ============================================================================
-# Print summary of dataset repos (most relevant for your template library)
-# ============================================================================
-
-dataset_repos = [r for r in all_repos if r["type"] == "dataset"]
-if dataset_repos:
-    print(f"\n{'='*50}")
-    print("📦 DATASET REPOSITORIES (useful for your template library):")
-    print('='*50)
-    for repo in dataset_repos:
-        print(f"  - {repo['full_name']}")
-        print(f"    Path: {repo['url']}")
-        if not repo["private"]:
-            print(f"    (public) ✅")
-        else:
-            print(f"    (private) 🔒")
-
-# ============================================================================
-# Summary of all repo paths (easy to copy)
+# Quick list of all repo paths (easy to copy)
 # ============================================================================
 
 print(f"\n{'='*50}")
-print("📂 ALL REPOSITORY PATHS (copy these):")
+print("📂 YOUR REPOSITORY PATHS:")
 print('='*50)
 for repo in all_repos:
-    print(f"{repo['full_name']}")
+    print(f"  {repo['full_name']}")
 
 print("\n✅ Done!")
