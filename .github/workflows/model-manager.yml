@@ -1,7 +1,7 @@
 name: Model Manager Test
 
 on:
-  workflow_dispatch:  # manual trigger only (builds take ~10-15 min)
+  workflow_dispatch:
 
 jobs:
   test-model-manager:
@@ -24,7 +24,6 @@ jobs:
 
       - name: Cache llama.cpp build
         uses: actions/cache@v4
-        id: llama-cache
         with:
           path: llama.cpp/build
           key: llama-build-${{ runner.os }}-${{ hashFiles('llama.cpp/**') }}
@@ -33,7 +32,6 @@ jobs:
 
       - name: Cache GGUF models
         uses: actions/cache@v4
-        id: model-cache
         with:
           path: gguf_models/
           key: models-${{ hashFiles('model_manager.py') }}
@@ -43,7 +41,6 @@ jobs:
       - name: Run model manager test
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          USE_LLAMA_CACHE: true
         run: python model_manager.py
 
       - name: Upload test results
@@ -51,7 +48,5 @@ jobs:
         if: always()
         with:
           name: model-manager-results
-          path: |
-            gguf_models/
-            llama.cpp/build/bin/llama-server
+          path: gguf_models/
           retention-days: 3
