@@ -1,11 +1,7 @@
-name: List Hugging Face Repositories
+name: List My Hugging Face Repositories
 
 on:
-  workflow_dispatch:                           # manual trigger only
-  push:
-    branches: [ main ]
-    paths:
-      - 'list_hf_repos.py'
+  workflow_dispatch:  # manual trigger only (don't auto-run)
 
 jobs:
   list-repos:
@@ -23,14 +19,13 @@ jobs:
       - name: Install huggingface_hub
         run: pip install -q huggingface_hub
 
-      - name: List Hugging Face repositories
+      - name: List my repositories
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python list_hf_repos.py
 
-      - name: Upload repository list as artifact
+      - name: Upload repository list
         uses: actions/upload-artifact@v4
-        if: always()
         with:
           name: hf-repo-list
           path: hf_repos.json
