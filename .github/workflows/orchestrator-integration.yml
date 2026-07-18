@@ -1,0 +1,67 @@
+name: Orchestrator Integration Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  integration-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake build-essential
+
+      - name: Install Python dependencies
+        run: |
+          pip install -q huggingface_hub requests psutil sentence-transformers numpy
+
+      - name: Cache llama.cpp build
+        uses: actions/cache@v4
+        with:
+          path: llama.cpp/build
+          key: llama-build-${{ runner.os }}-${{ hashFiles('llama.cpp/**') }}
+          restore-keys: |
+            llama-build-${{ runner.os }}-
+
+      - name: Cache GGUF models
+        uses: actions/cache@v4
+        with:
+          path: gguf_models/
+          key: models-${{ hashFiles('orchestrator_integration_test.py') }}
+          restore-keys: |
+            models-
+
+      - name: Cache templates and index
+        uses: actions/cache@v4
+        with:
+          path: templates_integration/
+          key: templates-${{ hashFiles('orchestrator_integration_test.py') }}
+          restore-keys: |
+            templates-
+
+      - name: Run integration test
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          TEMPLATES_REPO_ID: ${{ secrets.HF_REPO_ID }}
+        run: python orchestrator_integration_test.py
+
+      - name: Upload test artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-test-results
+          path: |
+            output_site/
+            templates_integration/_index/
+          retention-days: 7
