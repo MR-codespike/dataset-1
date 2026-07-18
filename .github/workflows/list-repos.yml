@@ -5,7 +5,7 @@ on:
   push:
     branches: [ main ]
     paths:
-      - 'list_hf_repos.py'                    # auto-run when script changes
+      - 'list_hf_repos.py'
 
 jobs:
   list-repos:
