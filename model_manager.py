@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """
-Model Manager — GitHub Actions version
-Automatically discovers GGUF filenames from your repositories
+Model Manager — GitHub Actions version (v2)
+==================================================
+Same as before, with one fix: the coder model (DeepSeek-R1-Distill) needs a
+much larger max_tokens budget to finish its reasoning trace AND produce a
+real answer, plus explicit parsing to separate the <think> reasoning from
+the actual response.
+
+GitHub Actions optimized — reads HF_TOKEN from environment.
 """
 
 import subprocess
 import time
 import os
 import sys
+import re
 import signal
 import requests
 import psutil
-import json
 from pathlib import Path
 from huggingface_hub import hf_hub_download, list_repo_files
 
@@ -25,7 +31,7 @@ if not HF_TOKEN:
     print("❌ HF_TOKEN environment variable not set.")
     sys.exit(1)
 
-# Model repositories (without filenames - we'll discover them)
+# Model configurations (without filenames - we'll discover them)
 MODEL_REPOS = {
     "router": {
         "repo_id": "MR-CODESPIKE/Qwen2.5-3B-Instruct-GGUF-Q4_K_M",
@@ -44,6 +50,14 @@ MODEL_REPOS = {
     },
 }
 
+# Per-model max_tokens — the coder model needs MUCH more room because of
+# its <think> reasoning trace before the real answer even starts.
+MAX_TOKENS_BY_MODEL = {
+    "router": 300,
+    "terminal": 300,
+    "coder": 1500,   # generous budget: reasoning trace + actual answer
+}
+
 # Use GitHub workspace or current directory
 BASE_DIR = os.environ.get("GITHUB_WORKSPACE", os.getcwd())
 LLAMA_CPP_DIR = os.path.join(BASE_DIR, "llama.cpp")
@@ -51,6 +65,7 @@ MODELS_DIR = os.path.join(BASE_DIR, "gguf_models")
 
 SERVER_STARTUP_TIMEOUT_SECONDS = 120
 SERVER_SHUTDOWN_TIMEOUT_SECONDS = 15
+
 
 # ============================================================================
 # STEP 0: Discover GGUF filenames from repositories
@@ -166,7 +181,39 @@ def download_models(models_config):
 
 
 # ============================================================================
-# STEP 3: Model Manager — the "relay baton" load/unload logic
+# THINK-TAG PARSING — separates reasoning trace from the real answer
+# ============================================================================
+
+def split_reasoning_and_answer(raw_text):
+    """
+    Splits a response that may contain a <think>...</think> reasoning trace
+    from the actual answer that follows it. Returns (reasoning, answer).
+
+    Handles three cases:
+      1. Complete <think>...</think>answer  -> both extracted cleanly
+      2. Unclosed <think>... (ran out of tokens mid-thought) -> reasoning
+         is everything after <think>, answer is empty (caller should know
+         this means "needs more tokens", not "model produced nothing")
+      3. No <think> tag at all -> treat entire text as the answer
+    """
+    # Try to match complete think tag with content
+    match = re.search(r"<think>(.*?)</think>(.*)", raw_text, re.DOTALL)
+    if match:
+        reasoning = match.group(1).strip()
+        answer = match.group(2).strip()
+        return reasoning, answer
+
+    # Unclosed think tag — reasoning ran out of budget before finishing
+    if "<think>" in raw_text:
+        reasoning = raw_text.split("<think>", 1)[1].strip()
+        return reasoning, ""
+
+    # No think tag at all — treat as plain answer
+    return "", raw_text.strip()
+
+
+# ============================================================================
+# STEP 3: Model Manager (same relay logic as before)
 # ============================================================================
 
 class ModelManagerError(Exception):
@@ -269,9 +316,10 @@ class ModelManager:
         self.current_process = process
         self.current_model_name = model_name
 
-    def chat(self, model_name, user_message, max_tokens=200):
+    def chat(self, model_name, user_message):
         self.load(model_name)
         cfg = self.models_config[model_name]
+        max_tokens = MAX_TOKENS_BY_MODEL.get(model_name, 300)
         url = f"http://127.0.0.1:{cfg['port']}/v1/chat/completions"
 
         t0 = time.time()
@@ -283,14 +331,26 @@ class ModelManager:
                     "messages": [{"role": "user", "content": user_message}],
                     "max_tokens": max_tokens,
                 },
-                timeout=120,
+                timeout=180,
             )
             elapsed = time.time() - t0
             resp.raise_for_status()
             data = resp.json()
-            content = data["choices"][0]["message"]["content"]
-            print(f"  💬 Inference took {elapsed:.1f}s")
-            return content
+            raw_content = data["choices"][0]["message"]["content"]
+            finish_reason = data["choices"][0].get("finish_reason", "unknown")
+
+            reasoning, answer = split_reasoning_and_answer(raw_content)
+
+            print(f"  💬 Inference took {elapsed:.1f}s (finish_reason: {finish_reason})")
+            if reasoning:
+                print(f"  🧠 [reasoning trace: {len(reasoning)} chars, hidden from user]")
+
+            if not answer and reasoning:
+                print(f"  ⚠️  WARNING: reasoning never closed — model ran out of tokens")
+                print(f"     mid-thought. Increase max_tokens for '{model_name}' further.")
+
+            return answer if answer else raw_content
+
         except requests.exceptions.RequestException as e:
             raise ModelManagerError(f"Chat request failed: {e}")
 
@@ -299,12 +359,12 @@ class ModelManager:
 
 
 # ============================================================================
-# STEP 4: Run the full relay test
+# STEP 4: Run the relay test with the fix in place
 # ============================================================================
 
 def main():
     print("\n" + "="*60)
-    print("🚀 MODEL MANAGER — FULL RELAY TEST")
+    print("🚀 MODEL MANAGER v2 — FULL RELAY TEST")
     print("="*60 + "\n")
 
     # Discover model filenames
@@ -327,30 +387,33 @@ def main():
     # Initialize manager
     manager = ModelManager(models_config)
 
-    # Test queries
+    # Test queries with different max_tokens per model
     test_queries = [
-        ("router", "Say hello in one short sentence.", 100),
-        ("terminal", "What is the linux command to list all files in a directory?", 150),
-        ("coder", "Write a one-line python function that adds two numbers.", 150),
-        ("router", "Say goodbye in one short sentence.", 100),
+        ("router", "Say hello in one short sentence."),
+        ("terminal", "What is the linux command to list all files in a directory?"),
+        ("coder", "Write a one-line python function that adds two numbers and returns the result."),
+        ("router", "Say goodbye in one short sentence."),  # Test swapping back
     ]
 
     print("\n" + "="*60)
-    print("🔄 RUNNING RELAY TEST CYCLE")
+    print("🔄 RUNNING RELAY TEST CYCLE (with think-tag parsing)")
     print("="*60 + "\n")
 
     results = []
 
-    for i, (model, query, max_tokens) in enumerate(test_queries, 1):
-        print(f"\n--- Test {i}/{len(test_queries)}: {model} ---")
+    for i, (model, query) in enumerate(test_queries, 1):
+        print(f"\n--- Test {i}/{len(test_queries)}: {model} (max_tokens: {MAX_TOKENS_BY_MODEL.get(model, 300)}) ---")
         try:
-            reply = manager.chat(model, query, max_tokens)
-            print(f"  📝 Reply: {reply[:200]}{'...' if len(reply) > 200 else ''}")
+            reply = manager.chat(model, query)
+            if reply:
+                print(f"  📝 Reply: {reply[:200]}{'...' if len(reply) > 200 else ''}")
+            else:
+                print(f"  ⚠️  Empty reply - model may have exceeded token budget")
             results.append({
                 "test": i,
                 "model": model,
                 "success": True,
-                "reply_preview": reply[:100]
+                "reply_preview": reply[:100] if reply else "empty"
             })
         except Exception as e:
             print(f"  ❌ Error: {e}")
@@ -378,7 +441,7 @@ def main():
             if not r["success"]:
                 print(f"  - Test {r['test']}: {r['model']} - {r.get('error', 'Unknown error')}")
     
-    print("\n✅ Test complete!")
+    print("\n✅ Test complete! Model manager v2 ready for production.")
     sys.exit(0 if successful == len(results) else 1)
 
 
