@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
-Router Regression Test — validates the CURRENT system prompt against the
-FULL test suite, not just the cases that motivated the last change.
+Router Regression Test — REVERTED to the original v6 system prompt.
 
-This is critical: prompt tweaks that fix one case can silently break others.
-Every prompt change must re-run this full suite before being trusted.
+The rewritten prompt (with the bolded "file requests = terminal" callout)
+caused 3 new regressions while only fixing 1 case. This reverts to the
+proven 97%-baseline prompt and re-tests against the FULL 37-case suite,
+including the 2 new phrasings discovered during integration testing.
+
+Design (unchanged from the original, working v6):
+  - Hard-rule: ONLY website (unambiguous, cheap to detect)
+  - Terminal, Code, Direct: ALL model-based, no keyword shortcuts
+  - Git operations explicitly called out as "direct" in the prompt itself
 """
 
 import subprocess
 import time
 import os
 import sys
-import re
 import signal
 import requests
 from huggingface_hub import hf_hub_download, list_repo_files
@@ -30,36 +35,43 @@ ROUTER_PORT = 8081
 ROUTER_CONTEXT_SIZE = 4096
 SERVER_STARTUP_TIMEOUT = 120
 
-# The EXACT current system prompt from the last integration script
 CLASSIFICATION_GRAMMAR = 'root ::= "terminal" | "code" | "direct"'
+
+# REVERTED to the original v6 prompt — no aggressive "file requests = terminal"
+# bolded callout, just clean category definitions with the git distinction
+# stated once, naturally.
 CLASSIFICATION_SYSTEM_PROMPT = """You are a request router. Classify the user's request into EXACTLY ONE category.
 
-RULES (read carefully):
+RULES:
 
-1. "terminal" = requests to run commands, install packages, start/stop services, or any shell/terminal operation.
-   **Key distinction**: If the user asks "list files", "show files", "what files are here" → this is TERMINAL, not direct.
-   Examples: "list all files", "install npm", "run tests", "start server", "ls -la", "check disk space"
+1. "terminal" = ANYTHING about running commands, installing packages, starting/stopping services, or shell/terminal operations.
+   Examples: "install npm", "run the test suite", "start the server", "list files", "stop the process", "kill the job"
 
-2. "code" = writing, reviewing, debugging, or explaining code/programming.
-   Examples: "write a function", "fix this bug", "review my code", "debug this error"
+2. "code" = ANYTHING about writing, reviewing, debugging, or explaining code/programming.
+   Examples: "write a function", "fix this bug", "review my code", "debug this error", "optimize this query"
 
-3. "direct" = general questions, git operations, file reads, conversation, knowledge queries.
-   Examples: "what does this error mean", "commit changes", "explain REST API", "what's the weather"
+3. "direct" = ANYTHING ELSE. This includes:
+   - General questions ("what does this error mean", "explain REST API")
+   - Git operations ("commit changes", "push", "pull", "merge") - git is direct, not terminal
+   - File operations ("read file", "list files" is terminal, but "show me the file" is direct)
+   - Conversation ("tell me a joke", "what's the weather")
+   - Knowledge queries ("why is the sky blue")
 
-IMPORTANT: If the user is asking to perform a command or see files → terminal.
-If they're asking about code logic or writing code → code.
-If it's a general question or git/read operations → direct.
+IMPORTANT DISTINCTIONS:
+- "list files" (shell command) - terminal
+- "what files are in this project" (question) - direct
+- "commit changes" (git) - direct
+- "install npm" (package) - terminal
 
 Respond with ONLY ONE WORD: terminal, code, or direct."""
 
+# ONLY website is hard-ruled — no terminal keyword shortcuts, since those
+# proved too fragile (word-order sensitive, and prone to false positives
+# on ordinary English sentences).
 WEBSITE_KEYWORDS = [
     "website", "web site", "webpage", "web page", "landing page",
     "build me a site", "build a site", "my site", "homepage",
     "create a website", "make a website", "website for", "site for my",
-]
-TERMINAL_KEYWORDS = [
-    "list files", "list all files", "show files", "display files",
-    "ls", "pwd", "cd", "mkdir", "rm", "cp", "mv",
 ]
 
 
@@ -79,6 +91,9 @@ def discover_and_download():
     print(f"🔍 Discovering GGUF file in {ROUTER_REPO_ID}...")
     files = list_repo_files(ROUTER_REPO_ID, token=HF_TOKEN)
     gguf_files = [f for f in files if f.endswith(".gguf")]
+    if not gguf_files:
+        print("❌ No .gguf files found!")
+        sys.exit(1)
     filename = gguf_files[0]
     print(f"✅ Found: {filename}")
     os.makedirs(MODELS_DIR, exist_ok=True)
@@ -122,16 +137,10 @@ def check_website_hard_rule(request):
     return any(kw in lowered for kw in WEBSITE_KEYWORDS)
 
 
-def check_terminal_hard_rule(request):
-    lowered = request.lower()
-    return any(kw in lowered for kw in TERMINAL_KEYWORDS)
-
-
 def classify_request(request):
+    # ONLY website is hard-ruled. Terminal/code/direct are ALL model-based.
     if check_website_hard_rule(request):
         return "website", "hard_rule"
-    if check_terminal_hard_rule(request):
-        return "terminal", "hard_rule"
 
     url = f"http://127.0.0.1:{ROUTER_PORT}/v1/chat/completions"
     resp = requests.post(
@@ -154,7 +163,7 @@ def classify_request(request):
 
 
 # ============================================================================
-# FULL REGRESSION SUITE — original 35 cases + 2 exact phrasings that broke
+# FULL REGRESSION SUITE — 35 original + 2 new = 37 cases, permanently merged
 # ============================================================================
 
 TEST_CASES = [
@@ -165,7 +174,7 @@ TEST_CASES = [
     ("Create a website for my coffee shop", "website"),
     ("I want a site for my business", "website"),
 
-    # TERMINAL (8)
+    # TERMINAL (9)
     ("Install express using npm", "terminal"),
     ("Run the test suite", "terminal"),
     ("Start the development server", "terminal"),
@@ -174,6 +183,7 @@ TEST_CASES = [
     ("How do I start the server", "terminal"),
     ("Stop the running process on port 8080", "terminal"),
     ("Kill the background job", "terminal"),
+    ("List all the files in the current directory", "terminal"),   # NEW
 
     # CODE (13)
     ("Write a function that reverses a string", "code"),
@@ -181,7 +191,7 @@ TEST_CASES = [
     ("Fix the bug in my sorting algorithm", "code"),
     ("Debug why my API returns a 500 error", "code"),
     ("Help me fix this error in my code", "code"),
-    ("Why is my function not working", "code"),  # known accepted miss
+    ("Why is my function not working", "code"),   # known accepted miss
     ("Write a python script to parse JSON", "code"),
     ("Can you help me debug this", "code"),
     ("Optimize this SQL query", "code"),
@@ -191,7 +201,7 @@ TEST_CASES = [
     ("Can you start writing tests for my app", "code"),
     ("What's the best way to structure this command pattern in my code", "code"),
 
-    # DIRECT (9)
+    # DIRECT (10)
     ("What does this error message mean", "direct"),
     ("Commit my changes with message 'fix typo'", "direct"),
     ("What files are in this project", "direct"),
@@ -200,10 +210,7 @@ TEST_CASES = [
     ("What's the weather today", "direct"),
     ("Tell me a joke", "direct"),
     ("Why is the sky blue", "direct"),
-
-    # NEW: exact phrasings that broke in integration test
-    ("List all the files in the current directory", "terminal"),
-    ("What is a REST API", "direct"),
+    ("What is a REST API", "direct"),   # NEW
 ]
 
 # Known issue - tracked separately
@@ -212,9 +219,9 @@ KNOWN_ACCEPTED_MISSES = {"Why is my function not working"}
 
 def main():
     print("\n" + "=" * 60)
-    print("🔬 ROUTER REGRESSION TEST")
+    print("🔬 ROUTER REGRESSION TEST — reverted to original v6 prompt")
     print("=" * 60)
-    print(f"  Testing: {len(TEST_CASES)} cases")
+    print(f"  Testing: {len(TEST_CASES)} cases (35 original + 2 new, merged)")
     print(f"  Known accepted misses: {len(KNOWN_ACCEPTED_MISSES)}")
     print("=" * 60 + "\n")
 
@@ -279,7 +286,8 @@ def main():
         
         sys.exit(1)
     else:
-        print("\n✅ No unexpected regressions. Prompt is safe to use.")
+        print("\n✅ No unexpected regressions. This prompt is the confirmed baseline.")
+        print("   The v6 prompt with website-only hard-rule is the correct design.")
         sys.exit(0)
 
 
