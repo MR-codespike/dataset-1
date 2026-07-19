@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Generate and Clean Training Data
-================================
-Generates 5,000 examples per category (15,000 total), cleans/deduplicates,
-and uploads to Hugging Face. No training - just data preparation.
+Generate and Clean Training Data (15 Models - 2026)
+====================================================
+Generates 15,000 examples per category (45,000 total), cleans/deduplicates,
+and uploads to Hugging Face. Uses 15 Gemini + Gemma models in the fallback chain.
 
 BEFORE YOU RUN:
   - Set GEMINI_API_KEY, HF_TOKEN, HF_REPO_ID in environment
@@ -22,7 +22,7 @@ from collections import defaultdict
 from huggingface_hub import HfApi, create_repo, upload_file
 
 # ============================================================================
-# CONFIG — read from environment
+# CONFIG
 # ============================================================================
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -42,22 +42,38 @@ BASE_DIR = os.environ.get("GITHUB_WORKSPACE", os.getcwd())
 OUTPUT_DIR = os.path.join(BASE_DIR, "classifier_data")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-EXAMPLES_PER_CATEGORY = 5000  # 5k per category
+EXAMPLES_PER_CATEGORY = 15000  # 15k per category
 EXAMPLES_PER_BATCH = 25
 
 # ============================================================================
-# GEMINI FALLBACK CHAIN
+# GEMINI + GEMMA FALLBACK CHAIN — 15 models (2026)
 # ============================================================================
 
 MODEL_CHAIN = [
+    # Gemini 3.x / 2.x models (verified from previous runs)
     {"name": "gemini-3.5-flash", "rpm": 10, "rpd": 250},
     {"name": "gemini-3-flash-preview", "rpm": 10, "rpd": 250},
     {"name": "gemini-2.5-pro", "rpm": 5, "rpd": 50},
     {"name": "gemini-3.1-flash-lite", "rpm": 15, "rpd": 1000},
     {"name": "gemini-2.5-flash", "rpm": 10, "rpd": 250},
-    {"name": "gemini-2.5-flash-lite", "rpm": 15, "rpd": 1000},
-    {"name": "gemini-2.5-flash-lite-preview-09-2025", "rpm": 15, "rpd": 1000},
+    
+    # Gemma models (open-weight, likely available via same endpoint)
+    {"name": "gemma-2-2b-it", "rpm": 15, "rpd": 1500},
+    {"name": "gemma-2-9b-it", "rpm": 10, "rpd": 500},
+    
+    # Additional Gemini models (2.x, 1.5, 1.0)
+    {"name": "gemini-3.0-pro", "rpm": 5, "rpd": 50},
+    {"name": "gemini-2.0-flash-exp", "rpm": 15, "rpd": 1500},
+    {"name": "gemini-2.0-flash", "rpm": 15, "rpd": 1500},
+    {"name": "gemini-1.5-pro", "rpm": 5, "rpd": 50},
+    {"name": "gemini-1.5-flash", "rpm": 15, "rpd": 1500},
+    
+    # Older Gemini models (last resort)
+    {"name": "gemini-1.0-pro", "rpm": 10, "rpd": 250},
+    {"name": "gemini-1.0-pro-001", "rpm": 10, "rpd": 250},
+    {"name": "gemini-1.0-pro-vision", "rpm": 10, "rpd": 250},
 ]
+
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
 
@@ -107,20 +123,34 @@ def call_gemini(model_name, prompt, max_retries=3):
         try:
             resp = requests.post(url, headers=headers, json=body, timeout=60)
             limiter.record()
+
+            if resp.status_code == 404:
+                limiter.mark_exhausted()
+                raise AllModelsExhaustedError(f"{model_name} not found (404)")
+
             if resp.status_code == 429:
                 if "quota" in resp.text.lower():
                     limiter.mark_exhausted()
                     raise AllModelsExhaustedError(f"{model_name} quota exhausted")
                 time.sleep((2 ** attempt) + random.uniform(0, 1))
                 continue
+
             if resp.status_code >= 500:
                 time.sleep((2 ** attempt) + random.uniform(0, 1))
                 continue
+
             resp.raise_for_status()
             data = resp.json()
-            text = "".join(p.get("text", "") for p in data["candidates"][0]["content"]["parts"])
+            candidates = data.get("candidates", [])
+            if not candidates:
+                raise ValueError("No candidates in response")
+            text = "".join(p.get("text", "") for p in candidates[0]["content"]["parts"])
             if text.strip():
                 return text
+            else:
+                raise ValueError("Empty response")
+        except AllModelsExhaustedError:
+            raise
         except Exception as e:
             print(f"  ⚠️ {model_name} attempt {attempt+1} failed: {e}")
             time.sleep((2 ** attempt) + random.uniform(0, 1))
@@ -134,15 +164,23 @@ def call_with_fallback(prompt):
         if not LIMITERS[cfg["name"]].can_use():
             continue
         try:
-            return call_gemini(cfg["name"], prompt)
+            print(f"  🔄 Trying {cfg['name']}...")
+            result = call_gemini(cfg["name"], prompt)
+            print(f"  ✅ {cfg['name']} succeeded")
+            return result
+        except AllModelsExhaustedError as e:
+            last_error = e
+            print(f"  ❌ {cfg['name']} skipped: {e}")
+            continue
         except Exception as e:
             last_error = e
+            print(f"  ❌ {cfg['name']} failed: {e}")
             continue
     raise AllModelsExhaustedError(f"All models exhausted: {last_error}")
 
 
 # ============================================================================
-# CATEGORY PROMPTS — includes hard cases that failed
+# CATEGORY PROMPTS (with hard cases)
 # ============================================================================
 
 CATEGORY_PROMPTS = {
@@ -234,89 +272,62 @@ def generate_category(category, target_count):
 
 
 # ============================================================================
-# DATA CLEANING FUNCTIONS
+# DATA CLEANING
 # ============================================================================
 
 def validate_text(text):
-    """Validate that text is a reasonable example."""
     if not isinstance(text, str):
         return False
     text = text.strip()
-    if len(text) < 3:  # Too short
+    if len(text) < 3 or len(text) > 200:
         return False
-    if len(text) > 200:  # Too long
-        return False
-    # Must contain at least one alphabetic character
     if not re.search(r'[a-zA-Z]', text):
         return False
     return True
 
-
 def clean_text(text):
-    """Clean text by normalizing whitespace and basic cleaning."""
     text = text.strip()
-    # Remove extra whitespace
     text = re.sub(r'\s+', ' ', text)
-    # Remove leading/trailing quotes
     text = re.sub(r'^[\'"](.*)[\'"]$', r'\1', text)
-    # Capitalize first letter
     if text and text[0].islower():
         text = text[0].upper() + text[1:]
     return text
 
-
 def deduplicate_data(data):
-    """Remove duplicates from dataset."""
     seen = set()
     unique = []
-    duplicate_count = 0
-    
+    dup_count = 0
     for item in data:
-        text = item["text"].strip().lower()
-        if text not in seen:
-            seen.add(text)
+        key = item["text"].strip().lower()
+        if key not in seen:
+            seen.add(key)
             unique.append(item)
         else:
-            duplicate_count += 1
-    
-    print(f"  🧹 Removed {duplicate_count} duplicates")
+            dup_count += 1
+    print(f"  🧹 Removed {dup_count} duplicates")
     return unique
 
-
 def validate_and_clean_dataset(data):
-    """Full cleaning pipeline."""
     print(f"\n🧹 Cleaning {len(data):,} examples...")
-    
-    # Step 1: Validate
     valid = []
-    invalid_count = 0
+    invalid = 0
     for item in data:
         if validate_text(item["text"]):
-            # Clean the text
             item["text"] = clean_text(item["text"])
             valid.append(item)
         else:
-            invalid_count += 1
-    
-    print(f"  ✅ {len(valid)} valid, {invalid_count} invalid removed")
-    
-    # Step 2: Deduplicate
+            invalid += 1
+    print(f"  ✅ {len(valid)} valid, {invalid} invalid removed")
     unique = deduplicate_data(valid)
-    
-    # Step 3: Check category balance
-    category_counts = defaultdict(int)
+    counts = defaultdict(int)
     for item in unique:
-        category_counts[item["label"]] += 1
-    
+        counts[item["label"]] += 1
     print(f"  📊 Category breakdown:")
-    for cat, count in sorted(category_counts.items()):
-        print(f"     {cat}: {count:,}")
-    
+    for cat, cnt in sorted(counts.items()):
+        print(f"     {cat}: {cnt:,}")
     return unique
 
-
 def load_existing_data():
-    """Load existing data from Hugging Face if available."""
     try:
         from huggingface_hub import hf_hub_download
         data_path = hf_hub_download(
@@ -328,8 +339,7 @@ def load_existing_data():
         data = []
         with open(data_path) as f:
             for line in f:
-                row = json.loads(line)
-                data.append(row)
+                data.append(json.loads(line))
         print(f"📂 Loaded {len(data):,} existing examples")
         return data
     except:
@@ -342,22 +352,16 @@ def load_existing_data():
 # ============================================================================
 
 def save_data(data, output_path):
-    """Save data to JSONL file."""
     with open(output_path, "w") as f:
         for row in data:
             f.write(json.dumps(row) + "\n")
     print(f"\n💾 Saved {len(data):,} examples to {output_path}")
 
-
 def upload_to_huggingface(data, output_path):
-    """Upload data to Hugging Face."""
     print(f"\n📤 Uploading to {HF_REPO_ID}...")
-    
     try:
         api = HfApi(token=HF_TOKEN)
         create_repo(repo_id=HF_REPO_ID, token=HF_TOKEN, repo_type=HF_REPO_TYPE, exist_ok=True)
-        
-        # Upload training data
         timestamp = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
         upload_file(
             path_or_fileobj=output_path,
@@ -366,50 +370,27 @@ def upload_to_huggingface(data, output_path):
             repo_type=HF_REPO_TYPE,
             commit_message=f"Add cleaned training data ({len(data):,} examples) - {timestamp}",
         )
-        
-        # Create README
-        readme = f"""# Classifier Training Data
-
-## Overview
-- **Total examples:** {len(data):,}
-- **Generated:** {timestamp}
-- **Format:** JSONL
-
-## Categories
-"""
-        category_counts = defaultdict(int)
+        # Generate README
+        counts = defaultdict(int)
         for item in data:
-            category_counts[item["label"]] += 1
-        
-        for cat, count in sorted(category_counts.items()):
-            readme += f"- **{cat}:** {count:,}\n"
-        
-        readme += "\n## Format\n"
-        readme += '```json\n{"text": "user request", "label": "category"}\n```\n'
-        readme += "\n## Usage\n"
-        readme += "```python\nimport json\n\nwith open('classifier_training_data.jsonl', 'r') as f:\n"
-        readme += "    for line in f:\n"
-        readme += "        data = json.loads(line)\n"
-        readme += "        text, label = data['text'], data['label']\n"
-        readme += "```\n"
-        
-        # Upload README
+            counts[item["label"]] += 1
+        readme = f"# Classifier Training Data\n\n## Overview\n- Total: {len(data):,}\n- Generated: {timestamp}\n"
+        for cat, cnt in sorted(counts.items()):
+            readme += f"- **{cat}:** {cnt:,}\n"
+        readme += "\n## Format\n```json\n{\"text\": \"user request\", \"label\": \"category\"}\n```\n"
         readme_path = os.path.join(os.path.dirname(output_path), "README.md")
         with open(readme_path, "w") as f:
             f.write(readme)
-        
         upload_file(
             path_or_fileobj=readme_path,
             path_in_repo="classifier_training_data/README.md",
             repo_id=HF_REPO_ID,
             repo_type=HF_REPO_TYPE,
-            commit_message=f"Add README for training data",
+            commit_message="Add README",
         )
-        
         print("✅ Upload complete!")
         print(f"   → https://huggingface.co/{HF_REPO_ID}/tree/main/classifier_training_data")
         return True
-        
     except Exception as e:
         print(f"⚠️ Upload failed: {e}")
         return False
@@ -421,54 +402,43 @@ def upload_to_huggingface(data, output_path):
 
 def main():
     print("\n" + "=" * 60)
-    print("🚀 GENERATE AND CLEAN TRAINING DATA")
+    print("🚀 GENERATE AND CLEAN TRAINING DATA (15 Models - 2026)")
     print("=" * 60)
     print(f"  Target per category: {EXAMPLES_PER_CATEGORY:,}")
     print(f"  Total target: {EXAMPLES_PER_CATEGORY * 3:,}")
+    print(f"  Models in chain: {len(MODEL_CHAIN)}")
+    for m in MODEL_CHAIN:
+        print(f"    - {m['name']} (RPM: {m['rpm']}, RPD: {m['rpd']})")
     print("=" * 60 + "\n")
 
-    # Load existing data
-    existing_data = load_existing_data()
-    
-    # Generate new data
+    existing = load_existing_data()
     all_data = []
-    for category in ["terminal", "code", "direct"]:
-        examples = generate_category(category, EXAMPLES_PER_CATEGORY)
+    for cat in ["terminal", "code", "direct"]:
+        examples = generate_category(cat, EXAMPLES_PER_CATEGORY)
         for ex in examples:
-            all_data.append({"text": ex, "label": category})
-        print(f"  ✅ Final count for {category}: {len(examples):,}")
-    
-    # Combine with existing data
-    if existing_data:
-        all_data.extend(existing_data)
+            all_data.append({"text": ex, "label": cat})
+        print(f"  ✅ Final count for {cat}: {len(examples):,}")
+
+    if existing:
+        all_data.extend(existing)
         print(f"\n📊 Combined: {len(all_data):,} total examples")
-    
-    # Clean the data
-    cleaned_data = validate_and_clean_dataset(all_data)
-    
-    # Save locally
+
+    cleaned = validate_and_clean_dataset(all_data)
     output_path = os.path.join(OUTPUT_DIR, "classifier_training_data.jsonl")
-    save_data(cleaned_data, output_path)
-    
-    # Upload to Hugging Face
-    upload_to_huggingface(cleaned_data, output_path)
-    
-    # Summary
+    save_data(cleaned, output_path)
+    upload_to_huggingface(cleaned, output_path)
+
     print("\n" + "=" * 60)
     print("✅ DATA GENERATION COMPLETE")
     print("=" * 60)
-    print(f"  Total examples: {len(cleaned_data):,}")
-    
-    category_counts = defaultdict(int)
-    for item in cleaned_data:
-        category_counts[item["label"]] += 1
-    
-    for cat, count in sorted(category_counts.items()):
-        print(f"  {cat}: {count:,}")
-    
+    counts = defaultdict(int)
+    for item in cleaned:
+        counts[item["label"]] += 1
+    print(f"  Total examples: {len(cleaned):,}")
+    for cat, cnt in sorted(counts.items()):
+        print(f"  {cat}: {cnt:,}")
     print("=" * 60)
     print("\n✅ Ready for training!")
-
 
 if __name__ == "__main__":
     main()
