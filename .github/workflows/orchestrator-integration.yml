@@ -64,4 +64,5 @@ jobs:
           path: |
             output_site/
             templates_integration/_index/
+            command_sandbox/
           retention-days: 7
