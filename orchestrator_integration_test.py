@@ -4,9 +4,9 @@ Full Orchestrator Integration Test — Corrected, self-contained version
 ==========================================================================
 
 Fixes:
-  1. Terminal model now has explicit system prompt to output ONLY shell commands
-  2. Test harness correctly counts command_failed and cancelled as failures
-  3. Real subprocess execution with proper error handling
+  1. Router prompt more explicit about terminal commands
+  2. Added "list files" to terminal keywords
+  3. Test harness correctly counts command_failed and cancelled as failures
 """
 
 import subprocess
@@ -53,23 +53,42 @@ MODEL_REPOS = {
 MAX_TOKENS_BY_MODEL = {"router": 300, "terminal": 100, "coder": 1500}
 SERVER_STARTUP_TIMEOUT_SECONDS = 120
 
+# Hard-rule keywords for website (unambiguous)
 WEBSITE_KEYWORDS = [
     "website", "web site", "webpage", "web page", "landing page",
     "build me a site", "build a site", "my site", "homepage",
     "create a website", "make a website", "website for", "site for my",
 ]
 
-# Router classification
+# Hard-rule keywords for terminal (unambiguous command requests)
+TERMINAL_KEYWORDS = [
+    "list files", "list all files", "show files", "display files",
+    "ls", "pwd", "cd", "mkdir", "rm", "cp", "mv",
+]
+
+# Router classification - more explicit about terminal vs direct
 CLASSIFICATION_GRAMMAR = 'root ::= "terminal" | "code" | "direct"'
 CLASSIFICATION_SYSTEM_PROMPT = """You are a request router. Classify the user's request into EXACTLY ONE category.
 
-1. "terminal" = running commands, installing packages, starting/stopping services, shell operations.
+RULES (read carefully):
+
+1. "terminal" = requests to run commands, install packages, start/stop services, or any shell/terminal operation.
+   **Key distinction**: If the user asks "list files", "show files", "what files are here" → this is TERMINAL, not direct.
+   Examples: "list all files", "install npm", "run tests", "start server", "ls -la", "check disk space"
+
 2. "code" = writing, reviewing, debugging, or explaining code/programming.
-3. "direct" = anything else: general questions, git operations, file reads, conversation.
+   Examples: "write a function", "fix this bug", "review my code", "debug this error"
+
+3. "direct" = general questions, git operations, file reads, conversation, knowledge queries.
+   Examples: "what does this error mean", "commit changes", "explain REST API", "what's the weather"
+
+IMPORTANT: If the user is asking to perform a command or see files → terminal.
+If they're asking about code logic or writing code → code.
+If it's a general question or git/read operations → direct.
 
 Respond with ONLY ONE WORD: terminal, code, or direct."""
 
-# FIX 1: Terminal model gets explicit system prompt to output ONLY commands
+# Terminal model gets explicit system prompt to output ONLY commands
 TERMINAL_SYSTEM_PROMPT = """You are a terminal command generator. Given a plain-English request, respond with ONLY the exact shell command needed to accomplish the task. DO NOT include explanations, apologies, markdown, or conversational text. The response must be a single, runnable shell command and nothing else.
 
 Examples:
@@ -329,9 +348,18 @@ class ModelManager:
 
 def real_classifier(user_request, manager):
     lowered = user_request.lower()
+    
+    # Hard-rule: website
     if any(kw in lowered for kw in WEBSITE_KEYWORDS):
         print("  [classified: website (hard_rule)]")
         return "website"
+    
+    # Hard-rule: terminal (unambiguous command requests)
+    if any(kw in lowered for kw in TERMINAL_KEYWORDS):
+        print("  [classified: terminal (hard_rule)]")
+        return "terminal"
+    
+    # Model-based classification
     category = manager.chat("router", user_request, grammar=CLASSIFICATION_GRAMMAR)
     print(f"  [classified: {category} (model)]")
     return category
@@ -341,7 +369,7 @@ def real_model_chat(model_name, message, manager):
     if model_name == "direct":
         model_name = "router"
     
-    # FIX: Terminal gets explicit system prompt
+    # Terminal gets explicit system prompt
     if model_name == "terminal":
         return manager.chat(model_name, message, system_prompt=TERMINAL_SYSTEM_PROMPT)
     
@@ -561,7 +589,6 @@ class AgentLoop:
             else:
                 exec_result = execute_action(proposed, confirmed=False, cwd=SANDBOX_DIR)
 
-            # FIX 2: command_failed is a REAL failure
             result["execution"] = exec_result
             if exec_result["returncode"] == 0:
                 result["status"] = "success"
@@ -599,6 +626,7 @@ def main():
     print("  ✅ Tool Executor: AUTO/CONFIRM/STRICT_CONFIRM (tested)")
     print("  ✅ Terminal commands: REAL subprocess execution")
     print("  ✅ Terminal model: Explicit system prompt for commands")
+    print("  ✅ Terminal hard-rule: 'list files' keywords")
     print("  ✅ Test harness: command_failed/cancelled = FAILURE")
     print("=" * 60 + "\n")
 
@@ -724,6 +752,7 @@ def main():
         print("   ✅ Real subprocess command execution")
         print("   ✅ Confidence threshold check (0.4 minimum)")
         print("   ✅ Terminal model has explicit system prompt")
+        print("   ✅ Terminal hard-rule for 'list files'")
         print("   ✅ Test harness correctly counts failures")
         sys.exit(0)
     else:
