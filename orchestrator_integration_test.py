@@ -3,13 +3,10 @@
 Full Orchestrator Integration Test — Corrected, self-contained version
 ==========================================================================
 
-Fixes vs previous run:
-  1. Replaces the reimplemented AUTO/WARN/CONFIRM/BLOCK tool executor with
-     the ACTUAL tested tool_executor logic (AUTO/CONFIRM/STRICT_CONFIRM,
-     the same dangerous-pattern regex set validated by 51 passing tests).
-  2. Terminal commands now REALLY execute via subprocess, not simulated.
-  3. Keeps the working confidence threshold check (0.4) from the last run —
-     that logic was correct and caught a real template-coverage gap.
+Fixes:
+  1. Terminal model now has explicit system prompt to output ONLY shell commands
+  2. Test harness correctly counts command_failed and cancelled as failures
+  3. Real subprocess execution with proper error handling
 """
 
 import subprocess
@@ -43,7 +40,7 @@ LLAMA_CPP_DIR = os.path.join(BASE_DIR, "llama.cpp")
 MODELS_DIR = os.path.join(BASE_DIR, "gguf_models")
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates_integration")
 OUTPUT_SITE_DIR = os.path.join(BASE_DIR, "output_site")
-SANDBOX_DIR = os.path.join(BASE_DIR, "command_sandbox")  # where real commands actually run
+SANDBOX_DIR = os.path.join(BASE_DIR, "command_sandbox")
 
 os.makedirs(OUTPUT_SITE_DIR, exist_ok=True)
 os.makedirs(SANDBOX_DIR, exist_ok=True)
@@ -61,6 +58,8 @@ WEBSITE_KEYWORDS = [
     "build me a site", "build a site", "my site", "homepage",
     "create a website", "make a website", "website for", "site for my",
 ]
+
+# Router classification
 CLASSIFICATION_GRAMMAR = 'root ::= "terminal" | "code" | "direct"'
 CLASSIFICATION_SYSTEM_PROMPT = """You are a request router. Classify the user's request into EXACTLY ONE category.
 
@@ -70,10 +69,20 @@ CLASSIFICATION_SYSTEM_PROMPT = """You are a request router. Classify the user's 
 
 Respond with ONLY ONE WORD: terminal, code, or direct."""
 
+# FIX 1: Terminal model gets explicit system prompt to output ONLY commands
+TERMINAL_SYSTEM_PROMPT = """You are a terminal command generator. Given a plain-English request, respond with ONLY the exact shell command needed to accomplish the task. DO NOT include explanations, apologies, markdown, or conversational text. The response must be a single, runnable shell command and nothing else.
+
+Examples:
+- "List all files" → "ls -la"
+- "Install python package requests" → "pip install requests"
+- "Start the development server" → "npm start"
+- "Check disk usage" → "df -h"
+
+Now respond with ONLY the shell command for:"""
+
 
 # ============================================================================
-# TOOL EXECUTOR — the ACTUAL tested module (AUTO/CONFIRM/STRICT_CONFIRM),
-# same dangerous-pattern set validated by the 51-test suite.
+# TOOL EXECUTOR — AUTO/CONFIRM/STRICT_CONFIRM with dangerous patterns
 # ============================================================================
 
 class ConfirmLevel(Enum):
@@ -104,10 +113,6 @@ def check_dangerous_pattern(command_text):
     return False, None
 
 
-class ToolExecutionError(Exception):
-    pass
-
-
 class ConfirmationRequiredError(Exception):
     pass
 
@@ -127,7 +132,7 @@ class ProposedAction:
 
 
 def propose_action(tool_name, **params):
-    base_level = ConfirmLevel.CONFIRM  # run_command is always at least CONFIRM
+    base_level = ConfirmLevel.CONFIRM
     danger_reason = None
     command = params.get("command", "")
     is_dangerous, reason = check_dangerous_pattern(command)
@@ -144,21 +149,22 @@ def execute_action(proposed, confirmed=False, cwd=None):
             f"'{proposed.tool_name}' requires confirmation (tier: {proposed.confirm_level.value})"
         )
     
-    # For safety in CI, we only execute commands in the sandbox
     cwd = cwd or SANDBOX_DIR
-    
     print(f"  🔧 Executing in sandbox: {cwd}")
     print(f"  🔧 Command: {proposed.params['command']}")
     
-    result = subprocess.run(
-        proposed.params["command"], 
-        shell=True, 
-        cwd=cwd,
-        capture_output=True, 
-        text=True, 
-        timeout=30,
-    )
-    return {"stdout": result.stdout, "stderr": result.stderr, "returncode": result.returncode}
+    try:
+        result = subprocess.run(
+            proposed.params["command"], 
+            shell=True, 
+            cwd=cwd,
+            capture_output=True, 
+            text=True, 
+            timeout=30,
+        )
+        return {"stdout": result.stdout, "stderr": result.stderr, "returncode": result.returncode}
+    except subprocess.TimeoutExpired:
+        return {"stdout": "", "stderr": "Command timed out after 30s", "returncode": -1}
 
 
 # ============================================================================
@@ -286,16 +292,19 @@ class ModelManager:
         self.current_model_name = model_name
         print(f"  ✅ Loaded '{model_name}'")
 
-    def chat(self, model_name, user_message, grammar=None):
+    def chat(self, model_name, user_message, grammar=None, system_prompt=None):
         if model_name == "direct":
             model_name = "router"
         self.load(model_name)
         cfg = self.models_config[model_name]
         max_tokens = MAX_TOKENS_BY_MODEL.get(model_name, 300)
         url = f"http://127.0.0.1:{cfg['port']}/v1/chat/completions"
-        messages = [{"role": "user", "content": user_message}]
-        if grammar:
-            messages.insert(0, {"role": "system", "content": CLASSIFICATION_SYSTEM_PROMPT})
+        
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_message})
+        
         body = {
             "model": model_name, 
             "messages": messages, 
@@ -304,6 +313,7 @@ class ModelManager:
         }
         if grammar:
             body["grammar"] = grammar
+        
         resp = requests.post(url, json=body, timeout=180)
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"].strip()
@@ -325,6 +335,17 @@ def real_classifier(user_request, manager):
     category = manager.chat("router", user_request, grammar=CLASSIFICATION_GRAMMAR)
     print(f"  [classified: {category} (model)]")
     return category
+
+
+def real_model_chat(model_name, message, manager):
+    if model_name == "direct":
+        model_name = "router"
+    
+    # FIX: Terminal gets explicit system prompt
+    if model_name == "terminal":
+        return manager.chat(model_name, message, system_prompt=TERMINAL_SYSTEM_PROMPT)
+    
+    return manager.chat(model_name, message)
 
 
 def real_extract_code_blocks(raw_text):
@@ -480,7 +501,7 @@ def dynamic_collect_business_data(match, user_request, templates_local_path):
 
 
 # ============================================================================
-# AGENT LOOP — terminal now uses REAL propose_action/execute_action
+# AGENT LOOP
 # ============================================================================
 
 class AgentLoopError(Exception):
@@ -500,12 +521,13 @@ class AgentLoop:
 
     def handle_request(self, user_request):
         category = self.classifier(user_request)
-        result = {"category": category, "request": user_request}
+        result = {"category": category, "request": user_request, "success": False}
 
         if category == "website":
             match = self.template_search(user_request)
             if not match:
                 result["status"] = "no_match"
+                result["success"] = False
                 return result
             result["template_used"] = match["id"]
             result["match_score"] = match["score"]
@@ -517,13 +539,15 @@ class AgentLoop:
             with open(os.path.join(OUTPUT_SITE_DIR, "style.css"), "w") as f:
                 f.write(css)
             result["status"] = "success"
+            result["success"] = True
             result["output_path"] = output_path
             return result
 
         elif category == "terminal":
-            drafted_command = self.model_chat("terminal", user_request).strip()
-            proposed = propose_action("run_command", command=drafted_command)
+            drafted_command = self.model_chat("terminal", user_request)
             result["proposed_command"] = drafted_command
+            
+            proposed = propose_action("run_command", command=drafted_command)
             result["confirm_level"] = proposed.confirm_level.value
             result["danger_reason"] = proposed.danger_reason
 
@@ -531,19 +555,27 @@ class AgentLoop:
                 confirmed = self.confirm_callback(proposed)
                 if not confirmed:
                     result["status"] = "cancelled"
+                    result["success"] = False
                     return result
                 exec_result = execute_action(proposed, confirmed=True, cwd=SANDBOX_DIR)
             else:
                 exec_result = execute_action(proposed, confirmed=False, cwd=SANDBOX_DIR)
 
-            result["status"] = "success" if exec_result["returncode"] == 0 else "command_failed"
+            # FIX 2: command_failed is a REAL failure
             result["execution"] = exec_result
+            if exec_result["returncode"] == 0:
+                result["status"] = "success"
+                result["success"] = True
+            else:
+                result["status"] = "command_failed"
+                result["success"] = False
             return result
 
         elif category == "code":
             response = self.model_chat("coder", user_request)
             explanation, code_blocks = self.extract_code_blocks(response)
             result["status"] = "success"
+            result["success"] = True
             result["explanation"] = explanation
             result["code_blocks"] = code_blocks
             return result
@@ -551,6 +583,7 @@ class AgentLoop:
         else:  # direct
             response = self.model_chat("direct", user_request)
             result["status"] = "success"
+            result["success"] = True
             result["response"] = response
             return result
 
@@ -561,11 +594,12 @@ class AgentLoop:
 
 def main():
     print("\n" + "=" * 60)
-    print("🚀 FULL ORCHESTRATOR INTEGRATION TEST (corrected)")
+    print("🚀 FULL ORCHESTRATOR INTEGRATION TEST (fixed)")
     print("=" * 60)
     print("  ✅ Tool Executor: AUTO/CONFIRM/STRICT_CONFIRM (tested)")
     print("  ✅ Terminal commands: REAL subprocess execution")
-    print("  ✅ Template search: Confidence threshold 0.4")
+    print("  ✅ Terminal model: Explicit system prompt for commands")
+    print("  ✅ Test harness: command_failed/cancelled = FAILURE")
     print("=" * 60 + "\n")
 
     models_config = discover_model_filenames()
@@ -579,9 +613,7 @@ def main():
         return real_classifier(request, manager)
 
     def model_chat_wrapper(model_name, message):
-        if model_name == "direct":
-            model_name = "router"
-        return manager.chat(model_name, message)
+        return real_model_chat(model_name, message, manager)
 
     def template_search_wrapper(request):
         return real_template_search(request, embed_model, embeddings, template_metadata, confidence_threshold=0.4)
@@ -626,11 +658,14 @@ def main():
             elapsed = time.time() - t0
             print(f"  Category: {result['category']}")
             print(f"  Status: {result.get('status')}")
+            print(f"  Success: {result.get('success')}")
             print(f"  Time: {elapsed:.1f}s")
             
             if result["category"] == "website" and result.get("status") == "success":
                 print(f"  Template: {result['template_used']} (score {result['match_score']:.3f})")
                 print(f"  Output: {result.get('output_path', 'N/A')}")
+            elif result["category"] == "website" and result.get("status") == "no_match":
+                print(f"  ❌ No template found above threshold")
             elif result["category"] == "terminal" and "execution" in result:
                 print(f"  Command: {result['proposed_command']}")
                 print(f"  Confirm tier: {result['confirm_level']}")
@@ -643,6 +678,8 @@ def main():
                 if stderr:
                     print(f"  Stderr: {stderr[:200]}")
                 print(f"  Return code: {result['execution']['returncode']}")
+                if result['execution']['returncode'] != 0:
+                    print(f"  ❌ Command failed (return code {result['execution']['returncode']})")
             elif result["category"] == "code":
                 print(f"  Code blocks: {len(result.get('code_blocks', []))}")
                 if result.get('code_blocks'):
@@ -650,7 +687,7 @@ def main():
             elif result["category"] == "direct" and "response" in result:
                 print(f"  Response: {result['response'][:200]}...")
                 
-            results.append({"request": req, "success": True, "result": result})
+            results.append({"request": req, "success": result.get("success", False), "result": result})
         except Exception as e:
             print(f"  ❌ ERROR: {e}")
             results.append({"request": req, "success": False, "error": str(e)})
@@ -672,15 +709,25 @@ def main():
     print(f"📊 RESULTS: {passed}/{len(results)} passed")
     print('='*60)
     
+    # Show failures
+    failures = [r for r in results if not r["success"]]
+    if failures:
+        print("\n❌ FAILURES:")
+        for r in failures:
+            req = r.get("request", "unknown")
+            status = r["result"].get("status", "unknown") if "result" in r else "exception"
+            print(f"  - \"{req}\": {status}")
+    
     if passed == len(results):
-        print("🎉 ALL TESTS PASSED! Orchestrator is ready for production!")
+        print("\n🎉 ALL TESTS PASSED! Orchestrator is ready for production!")
         print("   ✅ Tool Executor (AUTO/CONFIRM/STRICT_CONFIRM)")
         print("   ✅ Real subprocess command execution")
         print("   ✅ Confidence threshold check (0.4 minimum)")
-        print("   ✅ All 3 models load/unload correctly")
+        print("   ✅ Terminal model has explicit system prompt")
+        print("   ✅ Test harness correctly counts failures")
         sys.exit(0)
     else:
-        print(f"⚠️  {len(results) - passed} tests failed")
+        print(f"\n⚠️  {len(results) - passed} tests failed")
         sys.exit(1)
 
 
