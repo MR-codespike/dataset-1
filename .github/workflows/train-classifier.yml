@@ -1,0 +1,40 @@
+name: Train Classifier Head
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'classifier_training_data/*'
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install -q huggingface_hub sentence-transformers scikit-learn numpy joblib
+
+      - name: Train classifier head
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID: ${{ secrets.HF_REPO_ID }}
+        run: python train_classifier_head.py
+
+      - name: Upload model as artifact (backup)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: classifier-model
+          path: classifier_model/
+          retention-days: 7
