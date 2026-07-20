@@ -1,0 +1,56 @@
+name: Augment Dataset & Retrain Classifier
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_code:
+        description: 'Number of short code examples to add'
+        required: false
+        default: '400'
+      target_terminal:
+        description: 'Number of short terminal examples to add'
+        required: false
+        default: '150'
+
+jobs:
+  augment-and-train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install -q huggingface_hub requests sentence-transformers scikit-learn numpy joblib
+
+      - name: Run augmentation
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID: ${{ secrets.HF_REPO_ID }}
+          TARGET_CODE: ${{ github.event.inputs.target_code || '400' }}
+          TARGET_TERMINAL: ${{ github.event.inputs.target_terminal || '150' }}
+        run: python augment_dataset.py
+
+      - name: Retrain classifier (with JSON fix applied)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID: ${{ secrets.HF_REPO_ID }}
+        run: python train_classifier_head.py
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: classifier-artifacts
+          path: |
+            classifier_model/
+            augmented_data/
+          retention-days: 7
