@@ -1,0 +1,32 @@
+name: Balance Dataset
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_terminal:
+        description: 'Target number of terminal examples'
+        required: false
+        default: '1000'
+        type: string
+
+jobs:
+  balance:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install huggingface_hub
+        run: pip install -q huggingface_hub
+
+      - name: Run balance script
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID: ${{ secrets.HF_REPO_ID }}
+          TARGET_TERMINAL: ${{ github.event.inputs.target_terminal || '1000' }}
+        run: python balance_dataset.py
