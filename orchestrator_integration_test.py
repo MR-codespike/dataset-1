@@ -3,17 +3,10 @@
 Full Orchestrator Integration Test — trained classifier wired in
 =====================================================================
 
-Replaces the model-based router classification with the trained
-embedding + MLP classifier head (97% on the regression suite). The
-website hard rule is unchanged. Everything else (Tool Executor,
-confidence threshold, real subprocess execution, template patch
-pipeline) is carried over from the last working integration test.
-
-Key change: classification no longer loads/unloads the 3B router model.
-It's now: embed request (reusing the SAME MiniLM model already loaded
-for template retrieval) -> classifier.predict() -> category. Near-instant,
-no model swap. The 3B router model only loads when a "direct" request
-actually needs an answer generated.
+FIXES:
+1. Terminal: Strips wrapping quotes from drafted commands
+2. Router: "direct" → "router" remapping restored
+3. Clean terminal prompt (no quotes in examples)
 """
 
 import subprocess
@@ -50,11 +43,16 @@ CLASSIFIER_DIR = os.path.join(BASE_DIR, "classifier_model")
 for d in [OUTPUT_SITE_DIR, SANDBOX_DIR, CLASSIFIER_DIR]:
     os.makedirs(d, exist_ok=True)
 
+# ============================================================================
+# MODEL CONFIG — all 3 models present
+# ============================================================================
+
 MODEL_REPOS = {
+    "router": {"repo_id": "MR-CODESPIKE/Qwen2.5-3B-Instruct-GGUF-Q4_K_M", "port": 8081, "context_size": 4096},
     "terminal": {"repo_id": "MR-CODESPIKE/Qwen2.5-1.5B-Instruct-GGUF-Q4_K_M", "port": 8082, "context_size": 2048},
     "coder": {"repo_id": "MR-CODESPIKE/DeepSeek-R1-Distill-Qwen-1.5B-GGUF-Q4_K_M", "port": 8083, "context_size": 4096},
 }
-MAX_TOKENS_BY_MODEL = {"terminal": 100, "coder": 1500}
+MAX_TOKENS_BY_MODEL = {"router": 300, "terminal": 100, "coder": 1500}
 SERVER_STARTUP_TIMEOUT_SECONDS = 120
 
 WEBSITE_KEYWORDS = [
@@ -63,18 +61,19 @@ WEBSITE_KEYWORDS = [
     "create a website", "make a website", "website for", "site for my",
 ]
 
-TERMINAL_SYSTEM_PROMPT = """You are a terminal command generator. Given a plain-English request, respond with ONLY the exact shell command needed to accomplish the task. DO NOT include explanations, apologies, markdown, or conversational text. The response must be a single, runnable shell command and nothing else.
+# FIX 1: Clean terminal prompt — no quotes in examples
+TERMINAL_SYSTEM_PROMPT = """You are a terminal command generator. Given a plain-English request, respond with ONLY the exact shell command needed to accomplish the task. DO NOT include explanations, apologies, markdown, quotation marks, or conversational text. The response must be a single, runnable shell command and nothing else — no quotes around it.
 
 Examples:
-- "List all files" -> "ls -la"
-- "Install python package requests" -> "pip install requests"
-- "Start the development server" -> "npm start"
+- List all files -> ls -la
+- Install python package requests -> pip install requests
+- Start the development server -> npm start
 
 Now respond with ONLY the shell command for:"""
 
 
 # ============================================================================
-# TOOL EXECUTOR (proven, unchanged)
+# TOOL EXECUTOR
 # ============================================================================
 
 class ConfirmLevel(Enum):
@@ -138,8 +137,13 @@ def propose_action(tool_name, **params):
 def execute_action(proposed, confirmed=False, cwd=None):
     if proposed.confirm_level != ConfirmLevel.AUTO and not confirmed:
         raise ConfirmationRequiredError(f"'{proposed.tool_name}' requires confirmation")
+    
+    command = proposed.params['command']
+    # FIX: Strip literal quotes from the command
+    command = command.strip('"\'')
+    
     result = subprocess.run(
-        proposed.params["command"], shell=True, cwd=cwd,
+        command, shell=True, cwd=cwd or "/tmp",
         capture_output=True, text=True, timeout=30,
     )
     return {"stdout": result.stdout, "stderr": result.stderr, "returncode": result.returncode}
@@ -151,6 +155,7 @@ def execute_action(proposed, confirmed=False, cwd=None):
 
 def discover_model_filenames():
     models_config = {}
+    print("🔍 Discovering GGUF files...")
     for name, cfg in MODEL_REPOS.items():
         try:
             files = list_repo_files(cfg["repo_id"], token=HF_TOKEN)
@@ -227,7 +232,7 @@ def download_classifier():
 
 
 # ============================================================================
-# MODEL MANAGER (without router)
+# MODEL MANAGER — with "direct" → "router" remapping
 # ============================================================================
 
 class ModelManager:
@@ -281,7 +286,10 @@ class ModelManager:
         self.current_model_name = model_name
         print(f"  ✅ Loaded '{model_name}'")
 
+    # FIX 2: "direct" → "router" remapping
     def chat(self, model_name, user_message, system_prompt=None):
+        if model_name == "direct":
+            model_name = "router"
         self.load(model_name)
         cfg = self.models_config[model_name]
         max_tokens = MAX_TOKENS_BY_MODEL.get(model_name, 300)
@@ -299,7 +307,7 @@ class ModelManager:
 
 
 # ============================================================================
-# CLASSIFIER-BASED ROUTING (no model swap needed)
+# CLASSIFIER-BASED ROUTING
 # ============================================================================
 
 def check_website_hard_rule(request):
@@ -308,7 +316,6 @@ def check_website_hard_rule(request):
 
 
 def classify_request(request, embed_model, classifier, label_encoder):
-    """Website: hard rule. Terminal/code/direct: embedding + trained classifier."""
     if check_website_hard_rule(request):
         print("  [classified: website (hard_rule)]")
         return "website"
@@ -340,13 +347,13 @@ def real_template_search(request, embed_model, embeddings, template_metadata, co
 
 
 # ============================================================================
-# PATCH PIPELINE (unchanged)
+# PATCH PIPELINE
 # ============================================================================
 
 class PatchError(Exception):
     pass
 
-HEX_COLOR_PATTERN = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fa-fA-F]{6})$")
+HEX_COLOR_PATTERN = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
 
 def validate_business_data(meta, business_data):
     placeholders = meta["placeholders"]
@@ -478,6 +485,9 @@ class AgentLoop:
 
         elif category == "terminal":
             drafted_command = self.manager.chat("terminal", user_request, system_prompt=TERMINAL_SYSTEM_PROMPT).strip()
+            # FIX 1: Strip wrapping quotes the model might add despite instructions
+            if len(drafted_command) >= 2 and drafted_command[0] == drafted_command[-1] and drafted_command[0] in ('"', "'"):
+                drafted_command = drafted_command[1:-1].strip()
             proposed = propose_action("run_command", command=drafted_command)
             result["proposed_command"] = drafted_command
             result["confirm_level"] = proposed.confirm_level.value
@@ -579,6 +589,10 @@ def main():
             if result["category"] == "terminal" and "execution" in result:
                 print(f"  Command: {result['proposed_command']}")
                 print(f"  Return code: {result['execution']['returncode']}")
+                if result['execution']['stdout']:
+                    print(f"  Stdout: {result['execution']['stdout'][:200]}")
+                if result['execution']['stderr']:
+                    print(f"  Stderr: {result['execution']['stderr'][:200]}")
             if result["category"] == "code":
                 print(f"  Code blocks: {len(result.get('code_blocks', []))}")
             if result["category"] == "website" and result.get("status") == "success":
